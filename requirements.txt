@@ -1,0 +1,15 @@
+pandas
+pyyaml
+tree-sitter-cpp
+tree-sitter-c
+torch>=2.0.0
+transformers>=4.30.0
+numpy>=1.24.0
+tree-sitter>=0.22.0
+datasets>=2.14.0
+accelerate
+sentencepiece
+peft
+scikit-learn
+tqdm
+typing-extensions
