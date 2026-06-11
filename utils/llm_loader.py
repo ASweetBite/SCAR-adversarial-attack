@@ -2,12 +2,10 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 
 class LocalLLMClient:
-    """优化后的轻量级本地 LLM 客户端 - 已切换至 SDPA 模式"""
-
     def __init__(self, model_name="Qwen/Qwen2.5-1.5B-Instruct"):
-        print(f"[*] 正在初始化本地 LLM 生成器 ({model_name})...")
+        # Initializes the local LLM client with quantization and tokenizer setups.
+        print(f"[*] Initializing local LLM generator ({model_name})...")
 
-        # 4-bit 量化配置
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.float16,
@@ -28,7 +26,7 @@ class LocalLLMClient:
             quantization_config=bnb_config,
             device_map="auto",
             trust_remote_code=True,
-            attn_implementation=attn_impl  # 锁定为 sdpa
+            attn_implementation=attn_impl
         )
         self.model.eval()
 
@@ -36,7 +34,7 @@ class LocalLLMClient:
 
     @torch.no_grad()
     def chat(self, prompt: str) -> str:
-        """单次对话（低延迟优化）"""
+        # Performs a single chat turn with low latency optimization.
         messages = [
             {"role": "system", "content": "You are a precise coding assistant. Output ONLY a comma-separated list of alternative variable names. No explanations."},
             {"role": "user", "content": prompt}
@@ -60,7 +58,7 @@ class LocalLLMClient:
 
     @torch.no_grad()
     def batch_chat(self, prompts: list[str]) -> list[str]:
-        """批量对话：利用 SDPA 的并行能力同时处理多个变量"""
+        # Performs batch chat inference utilizing parallel processing.
         if not prompts:
             return []
 
@@ -72,7 +70,6 @@ class LocalLLMClient:
             ]
             texts.append(self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True))
 
-        # 批量编码，开启 padding
         inputs = self.tokenizer(texts, return_tensors="pt", padding=True).to(self.model.device)
 
         outputs = self.model.generate(
@@ -80,7 +77,6 @@ class LocalLLMClient:
             max_new_tokens=400,
             temperature=0.85,
             top_p=0.95,
-            # repetition_penalty=1.15,
             do_sample=True,
             pad_token_id=self.tokenizer.pad_token_id,
             eos_token_id=self.tokenizer.eos_token_id

@@ -9,9 +9,6 @@ from transformers import AutoTokenizer, AutoModel
 
 logger = logging.getLogger(__name__)
 
-# ==========================================
-# 1. CodeBERT Dual-Head Wrapper
-# ==========================================
 class CodeBERTDualHeadWrapper(nn.Module):
     def __init__(self, base_model, hidden_size, num_cwe_classes):
         """Initializes the dual-head wrapper with detection and classification heads."""
@@ -40,10 +37,6 @@ class CodeBERTDualHeadWrapper(nn.Module):
         """Returns the input embeddings from the base model."""
         return self.base_model.get_input_embeddings()
 
-
-# ==========================================
-# 2. CodeBERT Specific Model Loader
-# ==========================================
 class CodeBERTModelLoader:
     def __init__(self, config):
         """Parses the configuration and sets up parameters for model loading."""

@@ -7,12 +7,10 @@ from sklearn.preprocessing import LabelEncoder
 
 class DatasetLoader:
     def __init__(self):
-        """Initializes the dataset loader with label encoding and safe flag definitions."""
+        # Initializes the dataset loader with label encoding and safe flag definitions.
         self.label_encoder = LabelEncoder()
         self.label_map = {}
         self.mode = "binary"
-
-        # 这里的 safe_flags 主要是为了兼容当 vul=1 但 cwe 却为空或标注不明时的容错处理
         self.safe_flags = [
             "", "none", "0", "safe", "nan", "null", "false",
             "<null>", "<na>"
@@ -20,7 +18,7 @@ class DatasetLoader:
 
     def load_parquet_dataset(self, filepath: str, mode: str = "binary", max_samples: int = None,
                              random_seed: int = 50, label_map_path: Optional[str] = None) -> List[Dict]:
-        """Loads data from a Parquet file, applying sampling, label mapping, and data cleaning."""
+        # Loads data from a Parquet file, applying sampling, label mapping, and data cleaning.
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"Dataset file not found: {filepath}")
 
@@ -29,7 +27,6 @@ class DatasetLoader:
 
         df = pd.read_parquet(filepath)
 
-        # ✨ 修改点 1：根据 mode 动态校验列名
         if 'func' not in df.columns or 'vul' not in df.columns:
             raise ValueError("Parquet file must contain 'func' and 'vul' columns.")
 
@@ -42,11 +39,9 @@ class DatasetLoader:
         initial_count = len(df)
         df = df[df["func"].apply(_line_count) > 1].copy()
 
-        # ✨ 修改点 2：安全清洗。只有当 'cwe' 存在时才进行清洗操作
         if 'cwe' in df.columns:
             df["cwe"] = df["cwe"].fillna("").astype(str).str.strip()
 
-        # 清洗并标准化 vul 列为整数（0 或 1）
         df["vul"] = pd.to_numeric(df["vul"], errors='coerce').fillna(0).astype(int)
 
         print(
@@ -55,8 +50,6 @@ class DatasetLoader:
         processed_data = []
 
         if self.mode == "binary":
-            # 二分类核心修改，完全根据 vul 字段来决定 label
-            # vul == 0 -> 安全 (-1)；vul == 1 -> 漏洞 (1)
             df['label'] = df['vul'].apply(lambda x: -1 if x == 0 else 1)
 
             safe_df = df[df['label'] == -1]
@@ -84,7 +77,6 @@ class DatasetLoader:
             self.label_map = {-1: "Safe", 1: "Vulnerable"}
 
         elif self.mode == "multi":
-            # 多分类核心修改
             def determine_multi_label(row):
                 if row['vul'] == 0:
                     return "Safe"
@@ -151,12 +143,11 @@ class DatasetLoader:
         else:
             raise ValueError("Mode must be 'binary' or 'multi'")
 
-        # ✨ 修改点 3：在生成结果字典时使用 .get('cwe', '') 防止 KeyError
         for _, row in df.iterrows():
             processed_data.append({
                 "code": row["func"],
                 "label": int(row["label"]),
-                "raw_cwe": row.get("cwe", ""),  # 如果没有 cwe 列，默认为空字符串
+                "raw_cwe": row.get("cwe", ""),
                 "vul": row["vul"]
             })
 
@@ -164,5 +155,5 @@ class DatasetLoader:
         return processed_data
 
     def get_label_map(self) -> Dict:
-        """Returns the dictionary mapping integer labels to their string classifications."""
+        # Returns the dictionary mapping integer labels to their string classifications.
         return self.label_map

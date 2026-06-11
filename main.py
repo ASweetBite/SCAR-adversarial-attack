@@ -5,9 +5,9 @@ import numpy as np
 import torch
 import yaml
 
-from generator.light_generator import HeavyWeightCandidateGenerator
+from generator.heavy_generator import HeavyWeightCandidateGenerator
 from attacks.scar_attacker import IRTGAttacker
-from generator.heavy_generator import LightweightCandidateGenerator
+from generator.light_generator import LightweightCandidateGenerator
 from utils.ast_tools import IdentifierAnalyzer, CodeTransformer
 from utils.dataset_loader import DatasetLoader
 from utils.llm_loader import LocalLLMClient

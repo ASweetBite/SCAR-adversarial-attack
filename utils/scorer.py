@@ -1,25 +1,18 @@
 import json
-import os
 import re
-
 import nltk
 from nltk import pos_tag
 
 
 class StatisticalNamingScorer:
-    """
-    结合统计数据与 NLTK 词性标注的启发式打分器。
-    引入函数语义护城河：严格把控 Getter, Setter, Bool 的转换。
-    """
-
     def __init__(self, stats_file_path: str = 'naming_stats.json'):
+        # Initializes the scoring configuration, classifying blind spots and prefix classifications.
         self.stats_file_path = stats_file_path
         self.stats = {}
 
         self._load_stats()
         self._warmup_nltk()
 
-        # 动词/名词盲区
         self.VERB_BLIND_SPOTS = {
             'hash', 'run', 'read', 'write', 'load', 'save', 'init',
             'log', 'build', 'parse', 'bind', 'start', 'stop', 'cast',
@@ -27,18 +20,14 @@ class StatisticalNamingScorer:
             'alloc', 'free', 'pop', 'push', 'lock', 'unlock', 'clear', 'reset'
         }
         self.NOUN_BLIND_SPOTS = {
-            'log', 'hash', 'state', 'cache', 'count', 'size', 'len',"txt","num",
+            'log', 'hash', 'state', 'cache', 'count', 'size', 'len', "txt", "num",
             'ptr', 'idx', 'buf', 'tmp', 'str', 'ret', 'val', 'msg', 'req', 'res'
         }
 
-        # 函数语义动作分类库
         self.GETTER_VERBS = {'get', 'fetch', 'read', 'query', 'retrieve', 'calc', 'compute', 'find', 'search'}
         self.SETTER_VERBS = {'set', 'write', 'update', 'assign', 'put', 'init', 'clear', 'reset'}
         self.BOOL_PREFIXES = {'is', 'has', 'can', 'should', 'will', 'was', 'did', 'check', 'allow'}
 
-        # ==========================================
-        # [新增] 极短词白名单 (保护合法编程常识)
-        # ==========================================
         self.SHORT_WHITELIST = {
             'id', 'key', 'map', 'set', 'log', 'max', 'min', 'row', 'col',
             'pos', 'end', 'sum', 'num', 'val', 'ret', 'ptr', 'buf', 'tag',
@@ -47,6 +36,7 @@ class StatisticalNamingScorer:
         }
 
     def _load_stats(self):
+        # Loads naming statistics from a JSON file safely.
         if os.path.exists(self.stats_file_path):
             try:
                 with open(self.stats_file_path, 'r', encoding='utf-8') as f:
@@ -57,6 +47,7 @@ class StatisticalNamingScorer:
             self.stats = {}
 
     def _warmup_nltk(self):
+        # Warmup NLTK pos_tagger, downloading datasets if missing.
         try:
             pos_tag(["warmup"])
         except LookupError:
@@ -65,15 +56,11 @@ class StatisticalNamingScorer:
             pos_tag(["warmup"])
 
     def _is_abbreviation(self, w1: str, w2: str, long_w_parts: list = None) -> bool:
-        """
-        检查 w1 和 w2 是否互为高质量的缩写关系。
-        引入【首字母锚定规则】：缩写词的首字母，必须是长词中某个单词的首字母。
-        """
+        # Checks if one word is a high-quality abbreviation of another based on prefix matching.
         if not w1 or not w2: return False
         w1, w2 = w1.lower(), w2.lower()
         if w1 == w2: return False
 
-        # 确定长短词
         if len(w1) < len(w2):
             short_w, long_w = w1, w2
         else:
@@ -102,6 +89,7 @@ class StatisticalNamingScorer:
 
     def calculate_heuristic_score(self, cand_parts: list, entity_type: str, target_parts: list = None,
                                   return_type: str = None) -> float:
+        # Evaluates structural correctness of a candidate identifier name against stats and heuristic grammar.
         if not cand_parts:
             return 0.0
 
@@ -113,7 +101,6 @@ class StatisticalNamingScorer:
         if len(set(cand_parts)) != len(cand_parts):
             return -999.0
 
-        # 提前加载统计特征，用于短词豁免和后续校验
         entity_stats = self.stats.get(entity_type, {})
         known_prefixes = entity_stats.get('prefixes', {})
         known_suffixes = entity_stats.get('suffixes', {})
@@ -142,7 +129,6 @@ class StatisticalNamingScorer:
             score += 0.08
         else:
             if len(cand_parts) == 1 and len(cand_full) < 4:
-                # 结合真实统计数据：高频短词享受白名单待遇
                 is_frequent_in_stats = (known_prefixes.get(cand_full, 0) >= 0.001 or
                                         known_suffixes.get(cand_full, 0) >= 0.001)
 
@@ -221,18 +207,13 @@ class StatisticalNamingScorer:
         return score
 
     def _split_identifier(self, name: str):
-        """
-        [新增] 将标识符拆分为构成单词的列表，并返回风格。
-        从 Generator 迁移过来的高优切分引擎。
-        """
+        # Splits an identifier name into individual lexical words.
         if not name:
             return [], ''
 
         if '_' in name:
-            # 过滤掉连续下划线导致的空字符串
             return [p for p in name.split('_') if p], '_'
         else:
-            # 经典的正则：完美切分驼峰、帕斯卡以及连续大写缩写 (如 HTTPResponse -> HTTP, Response)
             parts = re.findall(r'[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|\d|\W|$)|\d+', name)
             if not parts or (len(parts) == 1 and parts[0] == name):
                 return [name], ''
