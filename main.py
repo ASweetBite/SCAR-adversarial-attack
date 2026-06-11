@@ -127,12 +127,7 @@ def main(args, config):
         random_seed=config['global'].get('random_seed', 42)
     )
 
-    # collector = PPLStatisticsCollector(...)
-
-    # 执行攻击
-    asr_matrix_vrtg, avg_queries = evaluator.attack(dataset)
-
-    # normalizer, random attacker... (按需开启)
+    evaluator.attack(dataset)
 
 
 if __name__ == "__main__":
