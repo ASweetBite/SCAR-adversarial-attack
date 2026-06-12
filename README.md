@@ -91,4 +91,4 @@ python analyze_rename_stealthiness.py \
 
 ## Contact
 
-Feel free to contact Ruizhe Ren (lwdcfxy22401@163.com), Hongbo Qu (2267606106@qq.com), Chengfeng Ren (rcf@stu.edu.ouc.cn) if you have any further questions.
+Feel free to contact Ruizhe Ren (lwdcfxy22401@163.com), Hongbo Qu (2267606106@qq.com), Chengfeng Ren (2863377060@qq.com) if you have any further questions.
