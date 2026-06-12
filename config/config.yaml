@@ -3,9 +3,8 @@
 # ==========================================
 global:
   random_seed: 42
-  max_workers: 8
   result_dir: "./results"
-  lang: "cpp"                 # 从 analyzer 移动到这里，统一全局语言
+  lang: "cpp"
 
 # ==========================================
 # 2. Runtime & Dataset Parameters
@@ -44,23 +43,18 @@ candidate_generation:
     top_k_mlm: 60
     top_n_keep: 50
     semantic_threshold: 0.87
-    fasttext_model_path: "./models/pretrained/fasttext_cpp.bin"
-    faiss_index_path: "./models/pretrained/faiss_cpp.index"
-    faiss_vocab_path: "./models/pretrained/vocab_cpp.json" # 修复了你原本的拼写错误
 
   # --- 重量级 (LLM) 专属配置 ---
   heavyweight:
     top_m: 25
     semantic_threshold: 0.87
-    structural_semantic_threshold: 0.5
-    context_ratio: 0.1
 
 # ==========================================
 # 5. Attack Optimization Algorithms
 # ==========================================
 attack:
-  algorithm: "beam"     # greedy, beam, ga, bo (移动自 run_params)
-  iterations: 25        # 移动自 run_params
+  algorithm: "beam"     # greedy, beam, ga
+  iterations: 25        # run_params
 
   irtg:
     top_k: 10
@@ -83,12 +77,3 @@ attack:
     mutation_rate_min: 0.1
     mutation_rate_max: 0.5
     elite_ratio: 0.25
-
-# ==========================================
-# 6. System Components
-# ==========================================
-smoother:
-  num_samples: 10
-  variance_threshold: 0.05
-  replace_prob: 0.5
-  batch_size: 32

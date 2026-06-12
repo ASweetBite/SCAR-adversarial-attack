@@ -1,9 +1,6 @@
-import math
 import random
 
 import numpy as np
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.preprocessing import OneHotEncoder
 
 
 class GeneticAlgorithmOptimizer:
@@ -122,7 +119,6 @@ class GeneticAlgorithmOptimizer:
 
             previous_best_fitness = best_fitness
 
-            # 收集评估
             for ind in population:
                 rename_map = {k: v for k, v in ind.items() if k != v}
                 cache_key = frozenset(rename_map.items())
@@ -136,7 +132,6 @@ class GeneticAlgorithmOptimizer:
                     except Exception:
                         fitness_cache[cache_key] = (float('-inf'), original_pred, code, None)
 
-            # 批量黑盒查询
             if codes_to_predict:
                 batch_probs, batch_preds = self.model_zoo.batch_predict(codes_to_predict, self.target_model)
                 for i in range(len(codes_to_predict)):
@@ -337,7 +332,7 @@ class GreedyOptimizer:
 
 
 import math
-from typing import List, Dict, Tuple, Any
+from typing import List, Dict, Tuple
 
 
 class BeamSearchOptimizer:
@@ -368,18 +363,10 @@ class BeamSearchOptimizer:
         self.early_stop_patience = int(beam_cfg.get('beam_early_stop_patience', 2))
         self.early_stop_min_valid_vars = int(beam_cfg.get('beam_early_stop_min_valid_vars', 3))
 
-        # ==========================================================
-        # AST 合法性校验：默认开启。
-        # 需要在 run(...) 中传入 analyzer；如果没有传入 analyzer，自动降级为只依赖 rename_fn。
-        # ==========================================================
         self.enable_ast_check = bool(beam_cfg.get('beam_enable_ast_check', True))
         self._warned_missing_analyzer = False
 
     def _calculate_fitness(self, probs: List[float], original_pred: int) -> float:
-        """
-        计算适应度 (Fitness): 评估替换词对模型置信度的破坏程度。
-        返回值越大，说明该替换词的攻击潜力越高。
-        """
         orig_idx = 0 if original_pred == -1 else original_pred
         orig_idx = min(orig_idx, len(probs) - 1)
         orig_prob = max(probs[orig_idx], 1e-9)
@@ -390,7 +377,6 @@ class BeamSearchOptimizer:
             target_prob = max(probs[target_idx], 1e-9)
             return math.log(target_prob) - math.log(orig_prob)
 
-        # 多分类 Margin Loss：防止概率扩散。
         other_probs = [p for i, p in enumerate(probs) if i != orig_idx]
         max_other_prob = max(other_probs) if other_probs else 1e-9
         max_other_prob = max(max_other_prob, 1e-9)

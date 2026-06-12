@@ -6,14 +6,14 @@ import torch
 import yaml
 
 from generator.heavy_generator import HeavyWeightCandidateGenerator
-from attacks.scar_attacker import IRTGAttacker
+from attacks.scar_attacker import SCARAttacker
 from generator.light_generator import LightweightCandidateGenerator
 from utils.ast_tools import IdentifierAnalyzer, CodeTransformer
 from utils.dataset_loader import DatasetLoader
 from utils.llm_loader import LocalLLMClient
 from utils.miner import NamingDataMiner
 from utils.mlm_engine import MLMEngine
-from utils.model_zoo import ModelZoo, CodeSmoother
+from utils.model_zoo import ModelZoo
 
 
 def main(args, config):
@@ -71,18 +71,12 @@ def main(args, config):
         config=config  # <--- 必须传完整的 config
     )
 
-    # =========================================================================
-    # 4. 初始化周边组件
-    # =========================================================================
-    smoother_cfg = config['smoother']
-    smoother = CodeSmoother(smoother_cfg, candidate_generator=lightweight_generator)
 
     model_configs = config['models'].get('target_models', {})
     model_zoo = ModelZoo(
         model_configs=model_configs,
         eval_mode=args.mode,
         config=config,
-        smoother=smoother
     )
     transformer = CodeTransformer()
 
@@ -106,7 +100,7 @@ def main(args, config):
     config['irtg_attacker'] = config['attack'].get('irtg', {})
     config['heavyweight_candidate'] = config['candidate_generation'].get('heavyweight', {})
 
-    evaluator = IRTGAttacker(
+    evaluator = SCARAttacker(
         model_zoo=model_zoo,
         get_all_vars_fn=get_all_identifiers_fn,
         mlm_gen=lightweight_generator,

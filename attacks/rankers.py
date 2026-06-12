@@ -16,7 +16,7 @@ class RNNS_Ranker:
 
     def rank_variables(self, code, variables, subs_pool, reference_label,
                        test_sample_size=10, top_k=10, filter_short_vars=True,
-                       guaranteed_head_size=2):  # [新增] 强制保留头部的词汇数量 (对应探针数量)
+                       guaranteed_head_size=2):
 
         oref_idx = 0 if reference_label == -1 else reference_label
         orig_prob = self.model_zoo.predict_label_conf(code, oref_idx, self.target_model)
@@ -24,23 +24,16 @@ class RNNS_Ranker:
         valid_vars = [v for v in variables if len(v) > 2] if filter_short_vars else variables
         mutation_tasks = []
 
-        # 串行执行重命名，彻底规避 AST Parser 多线程崩溃风险
         for var in valid_vars:
             all_cands = subs_pool.get(var, [])
             if not all_cands:
                 continue
 
-            # =========================================================
-            # [核心修复] 智能采样策略：头部绝对保留 + 尾部多样性采样
-            # =========================================================
             if len(all_cands) <= test_sample_size:
                 candidates = all_cands
             else:
-                # 1. 提取头部高优先级词汇 (确保 LLM 探针绝对不被遗漏)
                 head_cands = all_cands[:guaranteed_head_size]
 
-                # 2. 从剩余的词汇 (主要是海量 MLM 兜底词) 中随机抽取
-                # 这样做比死板地取前 8 个 MLM 词更好，能更全面地探测变量对不同乱码/相似词的敏感度分布
                 tail_pool = all_cands[guaranteed_head_size:]
                 sample_count = test_sample_size - len(head_cands)
 
@@ -67,7 +60,6 @@ class RNNS_Ranker:
         all_probs = []
         BATCH_SIZE = 16
 
-        # 分块推理，彻底杜绝 OOM
         for i in range(0, len(codes_to_predict), BATCH_SIZE):
             chunk = codes_to_predict[i:i + BATCH_SIZE]
             chunk_probs, _ = self.model_zoo.batch_predict(chunk, self.target_model)
