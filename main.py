@@ -17,35 +17,27 @@ from utils.model_zoo import ModelZoo
 
 
 def main(args, config):
-    """Orchestrates the evaluation of model robustness against various renaming attacks."""
-
-    # 读取全局语言
+    # Coordinates model execution, candidate generation, and the attack evaluation process.
     lang = config['global'].get('lang', 'cpp')
     analyzer = IdentifierAnalyzer(lang=lang)
 
-    # 路径映射调整
     cg_config = config.get('candidate_generation', {})
     stats_path = cg_config.get('naming_stats_path', 'naming_stats.json')
     dataset_path = config['run_params']['dataset']
 
-    # 1. 启发式命名数据挖掘
     if not os.path.exists(stats_path):
-        print(f"\n[!] 启发式命名统计字典 '{stats_path}' 不存在。")
-        print(f"[*] 正在启动离线数据挖掘程序 (基于数据集: {dataset_path})...")
+        print(f"\n[!] Heuristic naming statistics dictionary '{stats_path}' not found.")
+        print(f"[*] Launching offline data miner (based on dataset: {dataset_path})...")
         miner = NamingDataMiner(analyzer)
         miner.mine_parquet(dataset_path)
         miner.export_json(stats_path)
     else:
-        print(f"\n[*] 发现已存在的命名统计字典: {stats_path}，跳过挖掘阶段。")
+        print(f"\n[*] Existing naming statistics dictionary found: {stats_path}. Skipping mining phase.")
 
-    # 确保保存到配置中，供后续对象使用
     if 'candidate_generation' not in config:
         config['candidate_generation'] = {}
     config['candidate_generation']['naming_stats_path'] = stats_path
 
-    # =========================================================================
-    # 2. 加载底层引擎
-    # =========================================================================
     print("\n[*] Loading Engines and Models...")
     mlm_engine_name = config['models'].get('mlm_engine', 'microsoft/codebert-base-mlm')
     mlm_engine = MLMEngine(mlm_engine_name)
@@ -53,14 +45,10 @@ def main(args, config):
     llm_name = config['models'].get('llm_generator', 'models/qwen2.5-1.5b-code')
     llm_client = LocalLLMClient(model_name=llm_name)
 
-    # =========================================================================
-    # 3. 实例化双引擎生成器 (接口对齐)
-    # =========================================================================
-    # 传入全量 config，生成器内部按需解析
     lightweight_generator = LightweightCandidateGenerator(
         mlm_engine=mlm_engine,
         analyzer=analyzer,
-        config=config,  # <--- 必须传完整的 config
+        config=config,
         llm_client=llm_client,
     )
 
@@ -68,9 +56,8 @@ def main(args, config):
         embedder=mlm_engine,
         llm_client=llm_client,
         analyzer=analyzer,
-        config=config  # <--- 必须传完整的 config
+        config=config
     )
-
 
     model_configs = config['models'].get('target_models', {})
     model_zoo = ModelZoo(
@@ -81,22 +68,19 @@ def main(args, config):
     transformer = CodeTransformer()
 
     def get_all_identifiers_fn(code_str: str) -> list:
+        # Extracts non-main identifiers from the given code string.
         data = analyzer.extract_identifiers(code_str.encode("utf-8"))
         return [name for name in data.keys() if name != "main"]
 
     def rename_fn(code_str: str, renaming_map: dict) -> str:
+        # Renames identifiers within the code string according to a target renaming map.
         code_bytes = code_str.encode("utf-8")
         ids = analyzer.extract_identifiers(code_bytes)
         return transformer.validate_and_apply(code_bytes, ids, renaming_map, analyzer=analyzer)
 
-    # =========================================================================
-    # 5. 实例化并启动全新架构的 IRTGAttacker
-    # =========================================================================
-    # 将算法和迭代次数等写回 run_params 供下游兼容（因为 IRTGAttacker 里可能读 run_params）
     config['run_params']['algorithm'] = config['attack'].get('algorithm', 'beam')
     config['run_params']['iterations'] = config['attack'].get('iterations', 25)
 
-    # 补充 irtg_attacker 节点兼容 IRTGAttacker
     config['irtg_attacker'] = config['attack'].get('irtg', {})
     config['heavyweight_candidate'] = config['candidate_generation'].get('heavyweight', {})
 
