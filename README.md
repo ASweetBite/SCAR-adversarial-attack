@@ -77,4 +77,18 @@ python main.py \
        }
      }
      ```
+## Analyze result
 
+Use `analyze_rename_stealthiness.py` after you run the attack program:
+```bash
+python analyze_rename_stealthiness.py \
+    --input_json "results/attack_results.jsonl" \
+    --config "config/config.yaml" \
+    --out "evaluation_results" \
+    --top-k 20
+```
+`--top-k`: How many sets of data are included in the visual chart
+
+## Contact
+
+Feel free to contact Ruizhe Ren (lwdcfxy22401@163.com), Hongbo Qu (2267606106@qq.com), Chengfeng Ren (rcf@stu.edu.ouc.cn) if you have any further questions.
