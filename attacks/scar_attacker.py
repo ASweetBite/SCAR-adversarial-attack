@@ -29,7 +29,7 @@ class SCARAttacker:
         hw_cfg = cg_cfg.get('heavyweight', {})
 
         attack_cfg = config.get('attack', {})
-        irtg_cfg = attack_cfg.get('irtg', {})
+        scar_cfg = attack_cfg.get('scar', {})
 
         self.result_dir = _global.get('result_dir', "./results")
         self.run_mode = run_params.get('run_mode', 'attack')
@@ -42,11 +42,11 @@ class SCARAttacker:
 
         self.llm_top_m = hw_cfg.get('top_m', 25)
 
-        self.top_k = irtg_cfg.get('top_k', 5)
-        self.total_quota = irtg_cfg.get('total_quota', 50)
-        self.llm_probe_quota = irtg_cfg.get('llm_probe_quota', 4)
-        self.max_llm_enrich_attempts = irtg_cfg.get('max_llm_enrich_attempts', 2)
-        self.rerank_after_llm_enrich = irtg_cfg.get('rerank_after_llm_enrich', True)
+        self.top_k = scar_cfg.get('top_k', 5)
+        self.total_quota = scar_cfg.get('total_quota', 50)
+        self.llm_probe_quota = scar_cfg.get('llm_probe_quota', 4)
+        self.max_llm_enrich_attempts = scar_cfg.get('max_llm_enrich_attempts', 2)
+        self.rerank_after_llm_enrich = scar_cfg.get('rerank_after_llm_enrich', True)
 
         self.get_all_vars_fn = get_all_vars_fn
         self.mlm_gen = mlm_gen

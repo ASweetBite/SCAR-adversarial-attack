@@ -2,10 +2,10 @@ import os
 import gc
 import random
 import logging
+import argparse
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, RandomSampler, SequentialSampler
 from torch.optim import AdamW
 from tqdm import tqdm
@@ -17,8 +17,7 @@ from transformers import (
 from peft import get_peft_model, LoraConfig, TaskType
 from sklearn.metrics import recall_score, precision_score, f1_score
 
-# =============== 环境配置 ===============
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+# =============== Environment Configuration ===============
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                     datefmt='%m/%d/%Y %H:%M:%S',
                     level=logging.INFO)
@@ -36,7 +35,7 @@ def set_seed(seed=42):
         torch.backends.cudnn.deterministic = True
 
 
-# =============== 数据集定义 ===============
+# =============== Dataset Definition ===============
 
 class VulnerabilityDataset(Dataset):
     def __init__(self, tokenizer, parquet_path, max_len=512):
@@ -46,13 +45,13 @@ class VulnerabilityDataset(Dataset):
         df = pd.read_parquet(parquet_path)
         df['label'] = df['vul'].astype(int)
 
-        # 基础截断过滤
+        # Basic length truncation filtering
         df = df[df['func'].str.len() <= 4000].copy()
 
         funcs = df['func'].tolist()
         labels = df['label'].tolist()
 
-        for func, label in tqdm(zip(funcs, labels), total=len(funcs), desc=f"Tokenizing"):
+        for func, label in tqdm(zip(funcs, labels), total=len(funcs), desc="Tokenizing"):
             encoded = tokenizer(
                 func,
                 truncation=True,
@@ -77,11 +76,11 @@ class VulnerabilityDataset(Dataset):
         )
 
 
-# =============== 评估与训练逻辑 ===============
+# =============== Evaluation & Training Logic ===============
 
-def evaluate(model, eval_dataset, eval_batch_size, device):
+def evaluate(model, eval_dataset, args):
     eval_sampler = SequentialSampler(eval_dataset)
-    eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=eval_batch_size)
+    eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
 
     eval_loss = 0.0
     nb_eval_steps = 0
@@ -91,9 +90,9 @@ def evaluate(model, eval_dataset, eval_batch_size, device):
     y_trues = []
 
     for batch in tqdm(eval_dataloader, desc="Evaluating", leave=False):
-        inputs = batch[0].to(device)
-        attention_mask = batch[1].to(device)
-        labels = batch[2].to(device)
+        inputs = batch[0].to(args.device)
+        attention_mask = batch[1].to(args.device)
+        labels = batch[2].to(args.device)
 
         with torch.no_grad():
             outputs = model(inputs, attention_mask=attention_mask, labels=labels)
@@ -119,11 +118,11 @@ def evaluate(model, eval_dataset, eval_batch_size, device):
     }
 
 
-def train(model_name, model, train_dataset, eval_dataset, cfg):
+def train(model, train_dataset, eval_dataset, args):
     train_sampler = RandomSampler(train_dataset)
-    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=cfg["train_batch_size"])
+    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
 
-    t_total = len(train_dataloader) // cfg["gradient_accumulation_steps"] * cfg["num_epochs"]
+    t_total = len(train_dataloader) // args.gradient_accumulation_steps * args.num_epochs
 
     no_decay = ['bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
@@ -132,113 +131,117 @@ def train(model_name, model, train_dataset, eval_dataset, cfg):
         {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
     ]
 
-    optimizer = AdamW(optimizer_grouped_parameters, lr=cfg["learning_rate"], eps=1e-8)
+    optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=1e-8)
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=t_total)
 
-    logger.info(f"***** Running training for {model_name} *****")
+    logger.info(f"***** Running training for {args.model_name} *****")
 
     best_f1 = 0.0
     model.zero_grad()
 
-    for epoch in range(int(cfg["num_epochs"])):
+    for epoch in range(int(args.num_epochs)):
         bar = tqdm(train_dataloader, total=len(train_dataloader), desc=f"Epoch {epoch + 1}")
         for step, batch in enumerate(bar):
             model.train()
-            inputs = batch[0].to(cfg["device"])
-            attention_mask = batch[1].to(cfg["device"])
-            labels = batch[2].to(cfg["device"])
+            inputs = batch[0].to(args.device)
+            attention_mask = batch[1].to(args.device)
+            labels = batch[2].to(args.device)
 
             outputs = model(inputs, attention_mask=attention_mask, labels=labels)
             loss = outputs.loss
 
-            if cfg["gradient_accumulation_steps"] > 1:
-                loss = loss / cfg["gradient_accumulation_steps"]
+            if args.gradient_accumulation_steps > 1:
+                loss = loss / args.gradient_accumulation_steps
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
-            bar.set_postfix({"loss": round(loss.item() * cfg["gradient_accumulation_steps"], 4)})
+            bar.set_postfix({"loss": round(loss.item() * args.gradient_accumulation_steps, 4)})
 
-            if (step + 1) % cfg["gradient_accumulation_steps"] == 0:
+            if (step + 1) % args.gradient_accumulation_steps == 0:
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
 
-        # Epoch 结束，进行评估
-        results = evaluate(model, eval_dataset, cfg["eval_batch_size"], cfg["device"])
+        # Evaluate at the end of each epoch
+        results = evaluate(model, eval_dataset, args)
         logger.info(
             f"  Epoch {epoch + 1} Results: F1: {results['eval_f1']:.4f} | Recall: {results['eval_recall']:.4f} | Prec: {results['eval_precision']:.4f}")
 
         if results['eval_f1'] > best_f1:
             best_f1 = results['eval_f1']
-            output_dir = os.path.join(cfg["output_dir"], f"{model_name}_best_f1")
+            output_dir = os.path.join(args.output_dir, f"{args.model_name}_best_f1")
             os.makedirs(output_dir, exist_ok=True)
 
             model_to_save = model.module if hasattr(model, 'module') else model
             model_to_save.save_pretrained(output_dir)
-            logger.info(f"  [+] 新的最佳 F1 ({best_f1:.4f})! 模型已保存至 {output_dir}")
+            logger.info(f"  [+] New best F1 ({best_f1:.4f})! Model saved to {output_dir}")
 
 
-# =============== 主控流程 ===============
+# =============== Main Control Flow ===============
 
 def main():
-    # 📌 写死所有的超参数和数据路径，方便直接跑
-    cfg = {
-        "train_data_file": "data/alert/train.parquet",  # 替换为你的真实路径
-        "eval_data_file": "data/alert/valid.parquet",  # 替换为你的真实路径
-        "output_dir": "./models",
-        "train_batch_size": 16,
-        "eval_batch_size": 16,
-        "gradient_accumulation_steps": 1,
-        "learning_rate": 3e-4,
-        "num_epochs": 3,
-        "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-        "seed": 42
-    }
+    parser = argparse.ArgumentParser(description="LoRA Fine-tuning for Code Vulnerability Detection")
 
-    set_seed(cfg["seed"])
+    # Core data and path parameters
+    parser.add_argument("--train_data_file", type=str, required=True, help="Path to training Parquet file")
+    parser.add_argument("--eval_data_file", type=str, required=True, help="Path to validation Parquet file")
+    parser.add_argument("--output_dir", type=str, default="./models", help="Model output directory")
 
-    # 📌 写死你要跑的三个核心模型
-    models_to_train = {
-        # "CodeBERT": "microsoft/codebert-base",
-        # "GraphCodeBERT": "microsoft/graphcodebert-base",
-        "UniXcoder": "microsoft/unixcoder-base"
-    }
+    # Model architecture selection
+    parser.add_argument("--model_name", type=str, default="UniXcoder",
+                        help="Model alias (used for naming the output folder)")
+    parser.add_argument("--model_name_or_path", type=str, default="microsoft/unixcoder-base",
+                        help="HuggingFace model path or local path")
 
+    # Hyperparameter settings
+    parser.add_argument("--train_batch_size", type=int, default=16, help="Training batch size")
+    parser.add_argument("--eval_batch_size", type=int, default=16, help="Validation batch size")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Gradient accumulation steps")
+    parser.add_argument("--learning_rate", type=float, default=3e-4, help="Learning rate")
+    parser.add_argument("--num_epochs", type=int, default=3, help="Number of training epochs")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+
+    args = parser.parse_args()
+
+    # Set device
+    args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    set_seed(args.seed)
+
+    logger.info("\n" + "=" * 50)
+    logger.info(f"🚀 Initializing and starting training for: {args.model_name} ({args.model_name_or_path})")
+    logger.info("=" * 50)
+
+    # 1. Load Tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_name_or_path, bos_token="<s>", eos_token="</s>", sep_token="</s>",
+        cls_token="<s>", unk_token="<unk>", pad_token="<pad>", mask_token="<mask>",
+        additional_special_tokens=[]
+    )
+
+    # 2. Preprocess Data
+    train_dataset = VulnerabilityDataset(tokenizer, args.train_data_file)
+    eval_dataset = VulnerabilityDataset(tokenizer, args.eval_data_file)
+
+    # 3. Load Model & Inject LoRA
     peft_config = LoraConfig(task_type=TaskType.SEQ_CLS, r=8, lora_alpha=32, lora_dropout=0.1)
+    model = AutoModelForSequenceClassification.from_pretrained(args.model_name_or_path, num_labels=2,
+                                                               trust_remote_code=True)
+    model = get_peft_model(model, peft_config)
+    model.to(args.device)
 
-    for model_name, model_path in models_to_train.items():
-        logger.info("\n" + "=" * 50)
-        logger.info(f"🚀 初始化并开始训练: {model_name}")
-        logger.info("=" * 50)
+    # 4. Execute Training
+    train(model, train_dataset, eval_dataset, args)
 
-        # 1. 加载对应模型的 Tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_path, bos_token="<s>", eos_token="</s>", sep_token="</s>",
-            cls_token="<s>", unk_token="<unk>", pad_token="<pad>", mask_token="<mask>",
-            additional_special_tokens=[]
-        )
+    # 5. Save Tokenizer
+    tokenizer.save_pretrained(os.path.join(args.output_dir, f"{args.model_name}_best_f1"))
 
-        # 2. 针对当前 Tokenizer 预处理数据 (因为每个模型的词表可能不同)
-        train_dataset = VulnerabilityDataset(tokenizer, cfg["train_data_file"])
-        eval_dataset = VulnerabilityDataset(tokenizer, cfg["eval_data_file"])
-
-        # 3. 加载模型 & 注入 LoRA
-        model = AutoModelForSequenceClassification.from_pretrained(model_path, num_labels=2, trust_remote_code=True)
-        model = get_peft_model(model, peft_config)
-        model.to(cfg["device"])
-
-        # 4. 执行训练
-        train(model_name, model, train_dataset, eval_dataset, cfg)
-
-        # 5. 保存 Tokenizer (因为只保存了 model 的 weight)
-        tokenizer.save_pretrained(os.path.join(cfg["output_dir"], f"{model_name}_best_f1"))
-
-        # 📌 核心防爆显存逻辑：清理当前模型的驻留内存
-        del model, tokenizer, train_dataset, eval_dataset
-        gc.collect()
-        torch.cuda.empty_cache()
-        logger.info(f"✅ {model_name} 训练完毕，显存已清空。准备进入下一个模型。\n")
+    # 6. Clean up Memory
+    del model, tokenizer, train_dataset, eval_dataset
+    gc.collect()
+    torch.cuda.empty_cache()
+    logger.info(f"✅ {args.model_name} training completed, GPU memory cleared.\n")
 
 
 if __name__ == "__main__":

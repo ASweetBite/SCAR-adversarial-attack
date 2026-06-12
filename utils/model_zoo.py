@@ -1,59 +1,57 @@
 import logging
 import os
+import json
 from typing import List, Tuple
 
 import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from peft import PeftModel  # 新增依赖：用于处理 LoRA 权重
 
 logger = logging.getLogger(__name__)
 
 
 class ModelZooQueryTracker:
     def __init__(self, model_zoo):
-        # Initializes the query tracker by wrapping a model zoo instance.
         self._model_zoo = model_zoo
         self._query_count = 0
 
     def reset_counter(self):
-        # Resets the query counter to zero.
         self._query_count = 0
 
     def get_query_count(self):
-        # Returns the total number of intercepted queries.
         return self._query_count
 
     def predict(self, *args, **kwargs):
-        # Intercepts a single prediction query and increments the counter.
         self._query_count += 1
         return self._model_zoo.predict(*args, **kwargs)
 
     def batch_predict(self, codes, *args, **kwargs):
-        # Intercepts a batch prediction query and increments the counter by batch size.
         self._query_count += len(codes)
         return self._model_zoo.batch_predict(codes, *args, **kwargs)
 
     def predict_label_conf(self, *args, **kwargs):
-        # Intercepts a label confidence query and increments the counter.
         self._query_count += 1
         return self._model_zoo.predict_label_conf(*args, **kwargs)
 
     def __getattr__(self, name):
-        # Transparently forwards attribute lookups to the underlying model zoo.
         return getattr(self._model_zoo, name)
 
 
 class ModelZoo:
     def __init__(self, model_configs: dict, eval_mode: str, config: dict):
-        # Initializes the ModelZoo by loading classification models.
         glob_cfg = config.get('global', {})
         run_cfg = config.get('run_params', {})
 
         self.device = torch.device(glob_cfg.get('device', 'cuda' if torch.cuda.is_available() else 'cpu'))
         self.eval_mode = eval_mode
-        self.num_classes = run_cfg.get('num_classes', 16)
         self.max_seq_len = run_cfg.get('max_seq_len', 512)
-
+        if self.eval_mode == "binary":
+            self.num_classes = 2
+            print("[*] ModelZoo running in BINARY mode (Forcing num_classes = 2)")
+        else:
+            self.num_classes = run_cfg.get('num_classes', 16)  # 从 config 读多分类的具体数量
+            print(f"[*] ModelZoo running in MULTI mode (num_classes = {self.num_classes})")
         self.models = {}
         self.model_names = list(model_configs.keys())
 
@@ -64,17 +62,46 @@ class ModelZoo:
                 continue
 
             try:
-                print(f"[*] Loading standard HF classifier...")
                 tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
-                model = AutoModelForSequenceClassification.from_pretrained(path, trust_remote_code=True).to(
-                    self.device)
+
+                adapter_config_path = os.path.join(path, "adapter_config.json")
+
+                if os.path.exists(adapter_config_path):
+                    print(f"[*] Detected LoRA adapter. Parsing base model config...")
+                    with open(adapter_config_path, 'r', encoding='utf-8') as f:
+                        peft_config = json.load(f)
+
+                    base_model_name = peft_config.get("base_model_name_or_path")
+                    if not base_model_name:
+                        raise ValueError(f"Missing 'base_model_name_or_path' in {adapter_config_path}")
+
+                    print(f"[*] Loading base model skeleton from: {base_model_name}")
+                    base_model = AutoModelForSequenceClassification.from_pretrained(
+                        base_model_name,
+                        num_labels=self.num_classes,
+                        trust_remote_code=True
+                    )
+
+                    print(f"[*] Mounting LoRA weights and merging...")
+                    model = PeftModel.from_pretrained(base_model, path)
+                    model = model.merge_and_unload()
+                else:
+                    print(f"[*] Loading standard HF classifier...")
+                    model = AutoModelForSequenceClassification.from_pretrained(
+                        path,
+                        num_labels=self.num_classes,
+                        trust_remote_code=True
+                    )
+
+                model.to(self.device)
                 model.eval()
-                self.models[name] = {"type": "standard", "tokenizer": tokenizer, "model": model}
+                self.models[name] = {"type": "transformer", "tokenizer": tokenizer, "model": model}
+                print(f"[+] Successfully loaded {name} to {self.device}")
+
             except Exception as e:
                 print(f"[!] Error loading {name}: {e}")
 
     def predict(self, code: str, target_model: str) -> Tuple[List[float], int]:
-        # Predicts the label for a single code snippet using the target model.
         m = self.models.get(target_model)
         if m is None:
             return [1.0, 0.0], -1
@@ -95,7 +122,6 @@ class ModelZoo:
 
     def batch_predict(self, codes: List[str], target_model: str, batch_size: int = 32) -> Tuple[
         List[List[float]], List[int]]:
-        # Predicts labels for a batch of code snippets using the target model.
         m = self.models.get(target_model)
         if m is None:
             return [[1.0, 0.0]] * len(codes), [-1] * len(codes)
@@ -121,6 +147,5 @@ class ModelZoo:
         return all_probs, all_preds
 
     def predict_label_conf(self, code: str, label: int, target_model: str) -> float:
-        # Retrieves the confidence score for a specific label of a given code.
         probs, _ = self.predict(code, target_model)
         return probs[label] if label < len(probs) else 0.0

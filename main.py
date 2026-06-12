@@ -81,9 +81,6 @@ def main(args, config):
     config['run_params']['algorithm'] = config['attack'].get('algorithm', 'beam')
     config['run_params']['iterations'] = config['attack'].get('iterations', 25)
 
-    config['irtg_attacker'] = config['attack'].get('irtg', {})
-    config['heavyweight_candidate'] = config['candidate_generation'].get('heavyweight', {})
-
     evaluator = SCARAttacker(
         model_zoo=model_zoo,
         get_all_vars_fn=get_all_identifiers_fn,

@@ -385,7 +385,7 @@ class LightweightCandidateGenerator:
         return added
 
     def generate_candidates(self, batch_tasks: List[Dict[str, Any]], top_k_mlm: int = 40, top_n_keep: int = 20,
-                            is_ppl_filter: bool = False) -> Dict[str, List[str]]:
+                            ) -> Dict[str, List[str]]:
         # Generates semantic replacement candidates using contextual masked language modeling.
         results = {task["target_name"]: [] for task in batch_tasks}
         mlm_tracking = []
@@ -519,7 +519,6 @@ class LightweightCandidateGenerator:
             cg_cfg = self.config.get('candidate_generation', {})
             lw_cfg = cg_cfg.get('lightweight', {})
 
-            actual_is_ppl_filter = cg_cfg.get('is_ppl_filter', is_ppl_filter)
 
             ctx = {
                 'code_bytes': meta["full_code_bytes"],
@@ -533,7 +532,6 @@ class LightweightCandidateGenerator:
 
                 'semantic_threshold': lw_cfg.get('semantic_threshold', 0.85),
                 'preserve_style': cg_cfg.get('preserve_style', True),
-                'is_ppl_filter': actual_is_ppl_filter,
                 'ppl_max_ratio': cg_cfg.get('ppl_max_ratio', 1.2),
                 'ppl_max_abs': cg_cfg.get('ppl_max_abs', 50.0),
 

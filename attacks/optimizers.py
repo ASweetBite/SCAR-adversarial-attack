@@ -14,7 +14,7 @@ class GeneticAlgorithmOptimizer:
         run_cfg = config.get('run_params', {}) if config else {}
 
         self.pop_size = ga_cfg.get('pop_size', 40)
-        self.max_generations = run_cfg.get('iterations', 60)
+        self.max_generations = ga_cfg.get('iterations', 60)
         self.run_mode = run_cfg.get('run_mode', 'attack')
 
         self.stagnation_limit = ga_cfg.get('stagnation_threshold', 5)
@@ -397,7 +397,6 @@ class BeamSearchOptimizer:
                 return False
             return bad_chunk_count >= self.early_stop_patience
 
-        # 默认 dynamic：兼容你原来的“有明显提升就停，但变量数太少时不停”。
         if valid_var_count >= self.early_stop_min_valid_vars:
             return chunk_best_fitness_gain >= self.early_stop_delta
         return False
