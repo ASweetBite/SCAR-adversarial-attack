@@ -17,7 +17,7 @@ models:
   # HuggingFace ID or local path for the Masked Language Model (used for embeddings and lightweight generation).
   mlm_engine: "microsoft/codebert-base-mlm"
   # Local path or ID for the LLM used to generate deep semantic replacements.
-  llm_generator: "models/qwen2.5-1.5b-code"
+  llm_generator: "Qwen/Qwen2.5-Coder-1.5B-Instruct"
   # Dictionary of target classification models to attack.
   target_models:
     CodeBERT: "./models/CodeBERT_best_f1"

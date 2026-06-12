@@ -529,7 +529,7 @@ import torch.nn.functional as F
 import pandas as pd
 import numpy as np
 
-# 导入你项目中的原生模块
+# Import native modules from your project
 from utils.ast_tools import IdentifierAnalyzer
 from utils.llm_loader import LocalLLMClient
 from utils.mlm_engine import MLMEngine
@@ -540,12 +540,12 @@ def normalize_code(code: str) -> str:
     if not isinstance(code, str) or not code:
         return ""
 
-    # 1. 修复由于错误 dump 导致的双重转义 (把字面的 \n 恢复成真正的换行)
-    # 如果代码里连一个真正的换行符都没有，但有文本 "\n"，说明它被双重转义了
+    # 1. Fix double escaping caused by faulty dumps (restore literal \n to actual newlines)
+    # If there are no real newlines but literal "\n" exists, it was double-escaped
     if '\n' not in code and '\\n' in code:
         code = code.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
 
-    # 2. 统一 Windows (\r\n) 和 UNIX (\n) 换行符，防止 SequenceMatcher 因为看不见的 \r 误判
+    # 2. Unify Windows (\r\n) and UNIX (\n) newlines to prevent SequenceMatcher misjudgments due to hidden \r
     code = code.replace("\r\n", "\n").replace("\r", "\n")
 
     return code
@@ -564,7 +564,7 @@ def main():
     os.makedirs(args.out, exist_ok=True)
 
     # =========================================================================
-    # 1. 初始化引擎与配置 (与攻击主程序严格对齐)
+    # 1. Initialize Engines and Configs (Strictly aligned with the main attack program)
     # =========================================================================
     print(f"[*] Loading config from {args.config}...")
     with open(args.config, 'r', encoding='utf-8') as f:
@@ -574,13 +574,13 @@ def main():
     lang = config.get('global', {}).get('lang', 'cpp')
     analyzer = IdentifierAnalyzer(lang=lang)
 
-    mlm_engine_name = config['models'].get('mlm_engine', 'microsoft/codebert-base-mlm')
+    mlm_engine_name = config['models'].get('mlm_engine', 'Qwen/Qwen2.5-Coder-1.5B-Instruct')
     mlm_engine = MLMEngine(mlm_engine_name)
 
     llm_name = config['models'].get('llm_generator', 'models/qwen2.5-1.5b-code')
     llm_client = LocalLLMClient(model_name=llm_name)
 
-    # 实例化 Generator，直接复用其神级的特征池化与 AST 裁剪函数
+    # Instantiate the Generator, reusing its feature pooling and AST cropping functions
     mlm_gen = LightweightCandidateGenerator(
         mlm_engine=mlm_engine,
         analyzer=analyzer,
@@ -589,7 +589,7 @@ def main():
     )
 
     # =========================================================================
-    # 2. 读取并解析样本记录，提取精准的 AST 上下文
+    # 2. Read and Parse Sample Records, Extracting Precise AST Context
     # =========================================================================
     print(f"\n[*] Loading records from {args.input_json}...")
     records = load_json_records(args.input_json)
@@ -597,7 +597,7 @@ def main():
     all_metrics = []
     all_mapping_rows = []
 
-    # 用于批量计算的特征存储池
+    # Feature storage pools for batch calculations
     sim_prefixes, sim_orig_vars, sim_adv_vars, sim_suffixes, sim_record_indices = [], [], [], [], []
     ppl_orig_codes, ppl_adv_codes, ppl_record_indices = [], [], []
 
@@ -605,48 +605,45 @@ def main():
     for idx, record in enumerate(records):
         sample_id = record.get(args.sample_id_field, idx) if args.sample_id_field else idx
 
-        # 1. 数据清洗 (保留上次加的补丁)
+        # 1. Data cleaning (retaining previous patches)
         orig_code = normalize_code(record.get("original_code", ""))
         adv_code = normalize_code(record.get("adversarial_code", ""))
         record["original_code"] = orig_code
         record["adversarial_code"] = adv_code
 
-        # 2. 严格读取数据集真实的 is_success
+        # 2. Strictly read the true is_success from the dataset
         is_success = record.get("is_success", False)
         if isinstance(is_success, str):
             is_success = (is_success.lower() == 'true')
 
-        # 原有的基础结构指标分析
+        # Existing basic structural metric analysis
         metrics, mapping_rows = analyze_one_record(record, sample_id)
 
-        # 🚀 将真实的攻击结果强行记录到本条数据的 metrics 中
+        # Forcefully record the actual attack result into the metrics of this entry
         metrics["is_success"] = is_success
 
-        # 初始化深度学习指标
+        # Initialize deep learning metrics
         metrics.update({
             "semantic_similarity": np.nan, "orig_ppl": np.nan,
             "adv_ppl": np.nan, "ppl_ratio": np.nan, "ppl_diff": np.nan
         })
 
-        # 3. 只有真实判定为成功的样本，才去算它语义偏移了多少！
+        # 3. Only calculate semantic shift for samples that are truly evaluated as successful
         if is_success and orig_code and adv_code and orig_code != adv_code:
             ppl_orig_codes.append(orig_code)
             ppl_adv_codes.append(adv_code)
             ppl_record_indices.append(idx)
 
-            # --- 下方提取 AST 标识符和相似度的代码保持原样 ---
-            # ... orig_bytes = orig_code.encode("utf-8") ...
-
-            # --- 🎯 严格对齐过滤逻辑的上下文切片 ---
+            # Strict alignment filtering logic for context slicing
             orig_bytes = orig_code.encode("utf-8")
             identifiers = analyzer.extract_identifiers(orig_bytes)
 
-            # 2. 自动推断 replaced_names：如果 JSON 没提供，利用脚本自带的 Token 对齐结果动态推导
+            # Automatically infer replaced_names: if not provided by JSON, dynamically derive using the script's Token alignment results
             replaced_names = record.get("replaced_names")
             if not replaced_names:
                 replaced_names = {}
                 for row in mapping_rows:
-                    # mapping_rows 是前面 analyze_one_record 通过算法算出来的修改记录
+                    # mapping_rows contains the modification records calculated earlier by analyze_one_record
                     old_name = row["old_identifier"]
                     new_name = row["new_identifier"]
                     replaced_names[old_name] = new_name
@@ -655,11 +652,11 @@ def main():
                 old_var, new_var = str(old_var), str(new_var)
                 if old_var in identifiers and old_var != new_var:
                     try:
-                        # 1. 寻找最高信息量语境 (完全一致)
+                        # Find the context with the highest information content (exact match)
                         best_occ_idx = mlm_gen._find_best_context_occurrence(orig_bytes, identifiers[old_var])
                         target_info = identifiers[old_var][best_occ_idx]
 
-                        # 2. 提取语句级安全切片 (完全一致)
+                        # Extract statement-level safe slices (exact match)
                         local_prefix, local_suffix = mlm_gen._extract_local_context_ast(
                             orig_bytes, target_info['start'], target_info['end']
                         )
@@ -670,7 +667,7 @@ def main():
                         sim_suffixes.append(local_suffix)
                         sim_record_indices.append(idx)
                     except Exception as e:
-                        print(f"        [!] 解析变量上下文出错 {old_var}->{new_var}: {e}")
+                        print(f"        [!] Error parsing variable context {old_var}->{new_var}: {e}")
                         continue
         else:
             metrics.update({"semantic_similarity": np.nan, "orig_ppl": np.nan, "adv_ppl": np.nan, "ppl_ratio": np.nan, "ppl_diff": np.nan})
@@ -678,11 +675,6 @@ def main():
         all_metrics.append(metrics)
         all_mapping_rows.extend(mapping_rows)
 
-    # =========================================================================
-    # 3. 严格一致的批量深度学习指标推理
-    # =========================================================================
-
-    # 3.1 PPL 批量计算
     if ppl_orig_codes:
         ppl_bs = config.get('candidate_generation', {}).get('ppl_batch_size', 4)
         print(f"\n[*] Calculating Strict Perplexity for {len(ppl_orig_codes)} samples (Batch Size: {ppl_bs})...")
@@ -697,12 +689,14 @@ def main():
                 "ppl_ratio": float(batch_adv_ppls[i] / batch_orig_ppls[i]) if batch_orig_ppls[i] > 0 else float('inf')
             })
 
-    # 3.2 🎯 语义相似度批量计算 (核心对齐区)
+    # =========================================================================
+    # 3. Batch Calculation of Semantic Similarity (Core Alignment Zone)
+    # =========================================================================
     if sim_prefixes:
         print(f"[*] Calculating Target-Aware Token Similarity for {len(sim_prefixes)} rename instances...")
 
-        # 使用 _get_variable_token_embeddings 获取变量在语句切片中的均值池化特征
-        # 这个操作自动包含了混合精度 (AMP) 和精准 Token 对齐
+        # Use _get_variable_token_embeddings to get the mean pooled features of variables in statement slices
+        # This operation automatically includes Automatic Mixed Precision (AMP) and precise Token alignment
         orig_embs = mlm_gen._get_variable_token_embeddings(
             sim_prefixes, sim_orig_vars, sim_suffixes, batch_size=64
         ).to(mlm_engine.device)
@@ -711,10 +705,10 @@ def main():
             sim_prefixes, sim_adv_vars, sim_suffixes, batch_size=64
         ).to(mlm_engine.device)
 
-        # 完美的张量广播余弦相似度计算
+        # Tensor broadcast cosine similarity calculation
         sims = F.cosine_similarity(orig_embs, adv_embs, dim=-1).cpu().numpy()
 
-        # 聚合：如果一个样本替换了多个不同的变量，取其语义相似度的平均值
+        # Aggregate: If a sample replaces multiple different variables, take the average of their semantic similarities
         sample_sim_accum = {}
         sample_sim_count = {}
         for i, global_idx in enumerate(sim_record_indices):
@@ -726,25 +720,25 @@ def main():
             all_metrics[global_idx]["semantic_similarity"] = float(avg_sim)
 
     # =========================================================================
-    # 4. 结果汇总与保存
+    # 4. Result Aggregation and Saving
     # =========================================================================
     metrics_df = pd.DataFrame(all_metrics)
     mapping_df = pd.DataFrame(all_mapping_rows)
     metrics_df.to_csv(os.path.join(args.out, "sample_metrics.csv"), index=False, encoding="utf-8-sig")
     mapping_df.to_csv(os.path.join(args.out, "identifier_renames.csv"), index=False, encoding="utf-8-sig")
 
-    # 🚀 核心：划分出一个仅包含成功样本的 DataFrame
+    # Core: Partition a DataFrame containing only successful samples
     if "is_success" in metrics_df.columns:
         success_df = metrics_df[metrics_df["is_success"] == True]
     else:
         success_df = metrics_df
 
-    # 统计信息计算 (基于严格过滤的 success_df)
+    # Calculate statistics (based on the strictly filtered success_df)
     summary = {
         "num_total_samples": int(len(metrics_df)),
         "num_successfully_changed_samples": int(len(success_df)),
         "success_rate": float(len(success_df) / max(len(metrics_df), 1)),
-        # 这里只统计成功样本中的重命名对数量
+        # Only count the number of rename pairs in successful samples
         "num_rename_pairs_in_success": int(success_df["changed_identifier_occurrences"].sum()) if not success_df.empty else 0,
     }
 
@@ -756,7 +750,7 @@ def main():
         "semantic_similarity", "orig_ppl", "adv_ppl", "ppl_ratio", "ppl_diff"
     ]
 
-    # 🚀 注意：这里所有的 mean, median 计算都改为了使用 success_df
+    # Note: All mean and median calculations here are changed to use success_df
     for col in numeric_columns:
         if col in success_df.columns and not success_df.empty:
             valid_series = success_df[col].replace([np.inf, -np.inf], np.nan).dropna()
@@ -772,7 +766,7 @@ def main():
     with open(summary_json, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
-    # 生成直方图图表
+    # Generate histogram charts
     if not metrics_df.empty and "semantic_similarity" in metrics_df.columns:
         save_histogram(
             metrics_df.dropna(subset=["semantic_similarity"]),
@@ -782,7 +776,7 @@ def main():
             "Similarity Score (1.0 = identical)"
         )
 
-    print(f"\n✅ 终极后置评估完成! {len(metrics_df)} 个样本成功分析。数据已保存至: {args.out}")
+    print(f"\n Final post-evaluation completed! {len(metrics_df)} samples analyzed successfully. Data saved to: {args.out}")
 
 if __name__ == "__main__":
     main()
