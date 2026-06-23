@@ -17,6 +17,8 @@ from transformers import (
 from peft import get_peft_model, LoraConfig, TaskType
 from sklearn.metrics import recall_score, precision_score, f1_score
 
+from utils.ast_tools import IdentifierAnalyzer
+
 # =============== Environment Configuration ===============
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                     datefmt='%m/%d/%Y %H:%M:%S',
@@ -35,34 +37,88 @@ def set_seed(seed=42):
         torch.backends.cudnn.deterministic = True
 
 
-# =============== Dataset Definition ===============
+# =============== Dataset Definition (GraphCodeBERT 专属核心) ===============
 
-class VulnerabilityDataset(Dataset):
-    def __init__(self, tokenizer, parquet_path, max_len=512):
+class GraphCodeBERTVulDataset(Dataset):
+    def __init__(self, tokenizer, parquet_path, max_len=512, lang="c"):
         self.examples = []
+        self.max_len = max_len
         logger.info(f"Loading dataset file at {parquet_path}")
 
         df = pd.read_parquet(parquet_path)
         df['label'] = df['vul'].astype(int)
 
-        # Basic length truncation filtering
+        # 基础截断过滤
         df = df[df['func'].str.len() <= 4000].copy()
 
         funcs = df['func'].tolist()
         labels = df['label'].tolist()
 
-        for func, label in tqdm(zip(funcs, labels), total=len(funcs), desc="Tokenizing"):
-            encoded = tokenizer(
-                func,
-                truncation=True,
-                max_length=max_len,
-                padding='max_length'
-            )
-            self.examples.append({
-                "input_ids": encoded['input_ids'],
-                "attention_mask": encoded['attention_mask'],
-                "label": label
-            })
+        # 初始化 AST / DFG 提取器
+        logger.info("Initializing IdentifierAnalyzer for DFG extraction...")
+        self.analyzer = IdentifierAnalyzer(lang=lang)
+
+        for func, label in tqdm(zip(funcs, labels), total=len(funcs), desc="Extracting DFG & Tokenizing"):
+            try:
+                # 1. 提取 DFG 特征
+                code_bytes = func.encode('utf-8')
+                dfg_nodes, dfg_to_code, dfg_to_dfg = self.analyzer.extract_dataflow(code_bytes)
+
+                # 2. Tokenize 文本并预留空间
+                text_tokens = tokenizer.tokenize(func)
+                text_tokens = text_tokens[:max_len - 2 - len(dfg_nodes)]
+
+                total_tokens = [tokenizer.cls_token] + text_tokens + [tokenizer.sep_token] + dfg_nodes
+                input_ids = tokenizer.convert_tokens_to_ids(total_tokens)
+
+                # 3. 构造位置编码 (Position IDs)
+                text_len = len(text_tokens) + 2
+                position_ids = [i + tokenizer.pad_token_id + 1 for i in range(text_len)]
+                position_ids += [0 for _ in dfg_nodes]
+
+                # 4. 构造 2D 注意力掩码
+                seq_length = len(total_tokens)
+                attn_mask = np.zeros((seq_length, seq_length), dtype=bool)
+
+                # a. 文本互相可见
+                attn_mask[:text_len, :text_len] = True
+
+                # b. DFG 节点连通性
+                for idx, edges in enumerate(dfg_to_dfg):
+                    node_idx_in_matrix = text_len + idx
+                    for source_idx in edges:
+                        if source_idx < len(dfg_nodes):
+                            source_idx_in_matrix = text_len + source_idx
+                            attn_mask[node_idx_in_matrix, source_idx_in_matrix] = True
+                            attn_mask[source_idx_in_matrix, node_idx_in_matrix] = True
+
+                # 5. Padding 补齐
+                pad_len = max_len - seq_length
+                if pad_len > 0:
+                    input_ids += [tokenizer.pad_token_id] * pad_len
+                    position_ids += [tokenizer.pad_token_id] * pad_len
+
+                    padded_attn_mask = np.zeros((max_len, max_len), dtype=bool)
+                    padded_attn_mask[:seq_length, :seq_length] = attn_mask
+                else:
+                    input_ids = input_ids[:max_len]
+                    position_ids = position_ids[:max_len]
+                    padded_attn_mask = attn_mask[:max_len, :max_len]
+
+                # 6. 🌟 核心修复：转换为 3D 浮点掩码 (1, max_len, max_len)
+                # DataLoader 会自动将 batch 个 (1, L, L) 堆叠成 (B, 1, L, L)，完美契合 Hugging Face
+                float_mask = np.where(padded_attn_mask, 0.0, -10000.0)
+                float_mask_3d = np.expand_dims(float_mask, axis=0)
+
+                self.examples.append({
+                    "input_ids": input_ids,
+                    "attention_mask": float_mask_3d,
+                    "position_ids": position_ids,
+                    "label": label
+                })
+
+            except Exception as e:
+                continue
 
     def __len__(self):
         return len(self.examples)
@@ -71,7 +127,8 @@ class VulnerabilityDataset(Dataset):
         example = self.examples[item]
         return (
             torch.tensor(example['input_ids'], dtype=torch.long),
-            torch.tensor(example['attention_mask'], dtype=torch.long),
+            torch.tensor(example['attention_mask'], dtype=torch.float32),
+            torch.tensor(example['position_ids'], dtype=torch.long),
             torch.tensor(example['label'], dtype=torch.long)
         )
 
@@ -92,10 +149,17 @@ def evaluate(model, eval_dataset, args):
     for batch in tqdm(eval_dataloader, desc="Evaluating", leave=False):
         inputs = batch[0].to(args.device)
         attention_mask = batch[1].to(args.device)
-        labels = batch[2].to(args.device)
+        position_ids = batch[2].to(args.device)  # 解包 position_ids
+        labels = batch[3].to(args.device)
 
         with torch.no_grad():
-            outputs = model(inputs, attention_mask=attention_mask, labels=labels)
+            # 必须传入 position_ids
+            outputs = model(
+                input_ids=inputs,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                labels=labels
+            )
             eval_loss += outputs.loss.mean().item()
             logits_list.append(outputs.logits.cpu().numpy())
             y_trues.append(labels.cpu().numpy())
@@ -145,9 +209,16 @@ def train(model, train_dataset, eval_dataset, args):
             model.train()
             inputs = batch[0].to(args.device)
             attention_mask = batch[1].to(args.device)
-            labels = batch[2].to(args.device)
+            position_ids = batch[2].to(args.device)  # 解包 position_ids
+            labels = batch[3].to(args.device)
 
-            outputs = model(inputs, attention_mask=attention_mask, labels=labels)
+            # 必须传入 position_ids
+            outputs = model(
+                input_ids=inputs,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                labels=labels
+            )
             loss = outputs.loss
 
             if args.gradient_accumulation_steps > 1:
@@ -181,17 +252,17 @@ def train(model, train_dataset, eval_dataset, args):
 # =============== Main Control Flow ===============
 
 def main():
-    parser = argparse.ArgumentParser(description="LoRA Fine-tuning for Code Vulnerability Detection")
+    parser = argparse.ArgumentParser(description="LoRA Fine-tuning for GraphCodeBERT Vulnerability Detection")
 
     # Core data and path parameters
     parser.add_argument("--train_data_file", type=str, required=True, help="Path to training Parquet file")
     parser.add_argument("--eval_data_file", type=str, required=True, help="Path to validation Parquet file")
     parser.add_argument("--output_dir", type=str, default="./models", help="Model output directory")
 
-    # Model architecture selection
-    parser.add_argument("--model_name", type=str, default="CodeBERT",
+    # Model architecture selection (默认指向 GraphCodeBERT)
+    parser.add_argument("--model_name", type=str, default="GraphCodeBERT",
                         help="Model alias (used for naming the output folder)")
-    parser.add_argument("--model_name_or_path", type=str, default="microsoft/codebert-base",
+    parser.add_argument("--model_name_or_path", type=str, default="microsoft/graphcodebert-base",
                         help="HuggingFace model path or local path")
 
     # Hyperparameter settings
@@ -203,31 +274,28 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
 
     args = parser.parse_args()
-
-    # Set device
     args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     set_seed(args.seed)
 
     logger.info("\n" + "=" * 50)
-    logger.info(f"🚀 Initializing and starting training for: {args.model_name} ({args.model_name_or_path})")
+    logger.info(f"🚀 Initializing GraphCodeBERT structural training: {args.model_name_or_path}")
     logger.info("=" * 50)
 
-    # 1. Load Tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model_name_or_path, bos_token="<s>", eos_token="</s>", sep_token="</s>",
-        cls_token="<s>", unk_token="<unk>", pad_token="<pad>", mask_token="<mask>",
-        additional_special_tokens=[]
-    )
+    # 1. Load Tokenizer (移除不必要的 UniXcoder 特殊 Token)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
 
-    # 2. Preprocess Data
-    train_dataset = VulnerabilityDataset(tokenizer, args.train_data_file)
-    eval_dataset = VulnerabilityDataset(tokenizer, args.eval_data_file)
+    # 2. Preprocess Data with DFG Extraction
+    # 假设语言为 C/C++。若是 Python，需在内部指定 lang="python"
+    train_dataset = GraphCodeBERTVulDataset(tokenizer, args.train_data_file, lang="c")
+    eval_dataset = GraphCodeBERTVulDataset(tokenizer, args.eval_data_file, lang="c")
 
     # 3. Load Model & Inject LoRA
     peft_config = LoraConfig(task_type=TaskType.SEQ_CLS, r=8, lora_alpha=32, lora_dropout=0.1)
-    model = AutoModelForSequenceClassification.from_pretrained(args.model_name_or_path, num_labels=2,
-                                                               trust_remote_code=True)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        args.model_name_or_path,
+        num_labels=2,
+        trust_remote_code=True
+    )
     model = get_peft_model(model, peft_config)
     model.to(args.device)
 

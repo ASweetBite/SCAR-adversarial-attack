@@ -9,7 +9,7 @@ import numpy as np
 import torch
 
 from attacks.optimizers import GeneticAlgorithmOptimizer, GreedyOptimizer, BeamSearchOptimizer
-from attacks.rankers import RNNS_Ranker
+from attacks.rankers import PSR_Ranker
 from utils.model_zoo import ModelZooQueryTracker
 
 
@@ -95,7 +95,7 @@ class SCARAttacker:
         model_valid_counts = {m: 0 for m in self.model_names}
         shared_prep_time = 0.0
 
-        rankers = {m: RNNS_Ranker(self.model_zoo, m, self.rename_fn) for m in self.model_names}
+        rankers = {m: PSR_Ranker(self.model_zoo, m, self.rename_fn) for m in self.model_names}
         optimizers = {}
         for m in self.model_names:
             opt_kwargs = {"model_zoo": self.model_zoo, "target_model": m, "rename_fn": self.rename_fn,

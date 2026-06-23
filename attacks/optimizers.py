@@ -57,7 +57,6 @@ class GeneticAlgorithmOptimizer:
 
         background_vars = [v for v in all_vars if v not in target_vars]
 
-        # 2. 构建非对称变异概率表 (Asymmetric Mutation Probabilities)
         mutation_probs = {}
         if variable_scores and target_vars:
             scores = [variable_scores.get(v, 0) for v in target_vars]
@@ -72,8 +71,6 @@ class GeneticAlgorithmOptimizer:
         else:
             for v in target_vars: mutation_probs[v] = 0.3
 
-        # 🌟 为边缘基因赋予极低的探索性变异概率（例如 3%）
-        # 这使得 GA 偶尔能摸奖，但大部分算力依然集中在 target_vars 上
         for var in background_vars:
             mutation_probs[var] = 0.03
 
@@ -89,19 +86,15 @@ class GeneticAlgorithmOptimizer:
         best_code, best_fitness, best_probs, best_pred = code, float('-inf'), None, original_pred
         stagnation_counter = 0
 
-        # --- 初始化种群 (此时染色体长度为 len(all_vars)) ---
         population = [{var: var for var in all_vars}]  # 1. 保留完全不突变的原始基因
 
-        # 2. 注入 RNNS 精英种子
         if rnns_best_seed:
             seed_ind = {var: rnns_best_seed.get(var, var) for var in all_vars}
             population.append(seed_ind)
 
-        # 3. 填满剩余种群
         while len(population) < self.pop_size:
             ind = {}
             for v in all_vars:
-                # 初始种群生成时，靶点高频突变，边缘基因低频突变
                 if v in target_vars and random.random() < 0.8:
                     ind[v] = get_safe_choice(v, subs_pool.get(v, [v]) + [v])
                 elif v in background_vars and random.random() < 0.1:
@@ -109,8 +102,6 @@ class GeneticAlgorithmOptimizer:
                 else:
                     ind[v] = v
             population.append(ind)
-
-        print(f"\n--- 🧬 GA 初始化完成 (种群: {self.pop_size}, 核心基因: {len(target_vars)}, 边缘基因: {len(background_vars)}) ---")
 
         for gen in range(self.max_generations):
             evaluated = []
@@ -140,7 +131,6 @@ class GeneticAlgorithmOptimizer:
                     fitness = self._calculate_fitness(probs, original_pred)
                     fitness_cache[keys_to_predict[i]] = (fitness, pred, codes_to_predict[i], probs)
 
-            # 记录最优
             generation_best_fitness = float('-inf')
             for ind in population:
                 rename_map = {k: v for k, v in ind.items() if k != v}
@@ -157,16 +147,13 @@ class GeneticAlgorithmOptimizer:
                         if fitness > best_fitness:
                             best_fitness, best_code, best_probs, best_pred = fitness, mutated_code, probs, pred
                             current_target_prob = self._get_target_prob(probs, original_pred)
-                            print(f"  [Gen {gen + 1:02d}] 🌟 突破! 适应度: {fitness:.4f} | 目标概率: {current_target_prob:.2%} | 预测: {pred}")
 
                         if pred != original_pred and self.run_mode == "attack":
                             final_target_prob = self._get_target_prob(probs, original_pred)
-                            print(f"\n🎉 攻击成功！在第 {gen + 1} 代突破防线。最终目标概率: {final_target_prob:.2%}")
                             return True, mutated_code, probs, pred
 
             if best_probs is not None:
                 current_target_prob = self._get_target_prob(best_probs, original_pred)
-                print(f"[Gen {gen + 1:02d}/{self.max_generations}] 历史最优适应度: {best_fitness:.4f} | 目标概率: {current_target_prob:.2%}")
 
             # --- 繁衍逻辑 (交叉与突变现在覆盖全基因段) ---
             unique_evaluated = []
@@ -184,7 +171,6 @@ class GeneticAlgorithmOptimizer:
 
             unique_evaluated.sort(key=lambda x: x[1], reverse=True)
 
-            # 停滞重启机制 (Restart)
             if stagnation_counter >= self.stagnation_limit:
                 best_elite = unique_evaluated[0][0] if unique_evaluated else population[0]
                 population = [best_elite]
@@ -209,10 +195,8 @@ class GeneticAlgorithmOptimizer:
                 else:
                     p1, p2 = elites[0], elites[0]
 
-                # 交叉 (Crossover): 在全量变量上进行
                 child = {v: (p1[v] if random.random() > 0.5 else p2[v]) for v in all_vars}
 
-                # 突变 (Mutation): 依据动态/非对称概率字典进行触发
                 for v in child:
                     if random.random() < mutation_probs.get(v, 0.03):
                         child[v] = get_safe_choice(v, subs_pool.get(v, [v]) + [v], current_val=child[v])
@@ -223,7 +207,6 @@ class GeneticAlgorithmOptimizer:
 
         if best_probs is not None:
             final_target_prob = self._get_target_prob(best_probs, original_pred)
-            print(f"\n⚠️ 攻击结束。未能改变模型预测。最终目标概率峰值: {final_target_prob:.2%}")
 
         return (best_pred != original_pred), best_code, best_probs, best_pred
 

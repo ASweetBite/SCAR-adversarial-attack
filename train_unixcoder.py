@@ -35,32 +35,41 @@ def set_seed(seed=42):
         torch.backends.cudnn.deterministic = True
 
 
-# =============== Dataset Definition ===============
+# =============== Dataset Definition (UniXcoder 专属核心) ===============
 
-class VulnerabilityDataset(Dataset):
+class UniXcoderVulDataset(Dataset):
     def __init__(self, tokenizer, parquet_path, max_len=512):
         self.examples = []
+        self.max_len = max_len
         logger.info(f"Loading dataset file at {parquet_path}")
 
         df = pd.read_parquet(parquet_path)
         df['label'] = df['vul'].astype(int)
 
-        # Basic length truncation filtering
+        # 基础截断过滤
         df = df[df['func'].str.len() <= 4000].copy()
 
         funcs = df['func'].tolist()
         labels = df['label'].tolist()
 
-        for func, label in tqdm(zip(funcs, labels), total=len(funcs), desc="Tokenizing"):
-            encoded = tokenizer(
-                func,
-                truncation=True,
-                max_length=max_len,
-                padding='max_length'
-            )
+        # UniXcoder 专属模式控制符
+        mode_token = "<encoder-only>"
+
+        for func, label in tqdm(zip(funcs, labels), total=len(funcs), desc="Injecting Mode Tokens"):
+            tokens = tokenizer.tokenize(func)
+
+            tokens = tokens[:max_len - 4]
+
+            source_tokens = [tokenizer.bos_token, mode_token, tokenizer.eos_token] + tokens + [tokenizer.eos_token]
+            input_ids = tokenizer.convert_tokens_to_ids(source_tokens)
+
+            padding_length = max_len - len(input_ids)
+            input_ids += [tokenizer.pad_token_id] * padding_length
+            attention_mask = [1] * (max_len - padding_length) + [0] * padding_length
+
             self.examples.append({
-                "input_ids": encoded['input_ids'],
-                "attention_mask": encoded['attention_mask'],
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
                 "label": label
             })
 
@@ -95,7 +104,7 @@ def evaluate(model, eval_dataset, args):
         labels = batch[2].to(args.device)
 
         with torch.no_grad():
-            outputs = model(inputs, attention_mask=attention_mask, labels=labels)
+            outputs = model(input_ids=inputs, attention_mask=attention_mask, labels=labels)
             eval_loss += outputs.loss.mean().item()
             logits_list.append(outputs.logits.cpu().numpy())
             y_trues.append(labels.cpu().numpy())
@@ -147,7 +156,7 @@ def train(model, train_dataset, eval_dataset, args):
             attention_mask = batch[1].to(args.device)
             labels = batch[2].to(args.device)
 
-            outputs = model(inputs, attention_mask=attention_mask, labels=labels)
+            outputs = model(input_ids=inputs, attention_mask=attention_mask, labels=labels)
             loss = outputs.loss
 
             if args.gradient_accumulation_steps > 1:
@@ -163,7 +172,6 @@ def train(model, train_dataset, eval_dataset, args):
                 scheduler.step()
                 optimizer.zero_grad()
 
-        # Evaluate at the end of each epoch
         results = evaluate(model, eval_dataset, args)
         logger.info(
             f"  Epoch {epoch + 1} Results: F1: {results['eval_f1']:.4f} | Recall: {results['eval_recall']:.4f} | Prec: {results['eval_precision']:.4f}")
@@ -181,20 +189,18 @@ def train(model, train_dataset, eval_dataset, args):
 # =============== Main Control Flow ===============
 
 def main():
-    parser = argparse.ArgumentParser(description="LoRA Fine-tuning for Code Vulnerability Detection")
+    parser = argparse.ArgumentParser(description="LoRA Fine-tuning for UniXcoder Vulnerability Detection")
 
-    # Core data and path parameters
     parser.add_argument("--train_data_file", type=str, required=True, help="Path to training Parquet file")
     parser.add_argument("--eval_data_file", type=str, required=True, help="Path to validation Parquet file")
     parser.add_argument("--output_dir", type=str, default="./models", help="Model output directory")
 
-    # Model architecture selection
-    parser.add_argument("--model_name", type=str, default="CodeBERT",
+    # 默认指向 UniXcoder
+    parser.add_argument("--model_name", type=str, default="UniXcoder",
                         help="Model alias (used for naming the output folder)")
-    parser.add_argument("--model_name_or_path", type=str, default="microsoft/codebert-base",
+    parser.add_argument("--model_name_or_path", type=str, default="microsoft/unixcoder-base",
                         help="HuggingFace model path or local path")
 
-    # Hyperparameter settings
     parser.add_argument("--train_batch_size", type=int, default=16, help="Training batch size")
     parser.add_argument("--eval_batch_size", type=int, default=16, help="Validation batch size")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Gradient accumulation steps")
@@ -203,31 +209,27 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
 
     args = parser.parse_args()
-
-    # Set device
     args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     set_seed(args.seed)
 
     logger.info("\n" + "=" * 50)
-    logger.info(f"🚀 Initializing and starting training for: {args.model_name} ({args.model_name_or_path})")
+    logger.info(f"🚀 Initializing UniXcoder structural training: {args.model_name_or_path}")
     logger.info("=" * 50)
 
-    # 1. Load Tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model_name_or_path, bos_token="<s>", eos_token="</s>", sep_token="</s>",
-        cls_token="<s>", unk_token="<unk>", pad_token="<pad>", mask_token="<mask>",
-        additional_special_tokens=[]
-    )
+    # 1. 严格加载 UniXcoder 的 Tokenizer
+    # 注意：与 GraphCodeBERT 不同，不要用 trust_remote_code=True 的默认推断，防止加载串味
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
 
-    # 2. Preprocess Data
-    train_dataset = VulnerabilityDataset(tokenizer, args.train_data_file)
-    eval_dataset = VulnerabilityDataset(tokenizer, args.eval_data_file)
+    # 2. Preprocess Data with Mode Token Injection
+    train_dataset = UniXcoderVulDataset(tokenizer, args.train_data_file)
+    eval_dataset = UniXcoderVulDataset(tokenizer, args.eval_data_file)
 
     # 3. Load Model & Inject LoRA
     peft_config = LoraConfig(task_type=TaskType.SEQ_CLS, r=8, lora_alpha=32, lora_dropout=0.1)
-    model = AutoModelForSequenceClassification.from_pretrained(args.model_name_or_path, num_labels=2,
-                                                               trust_remote_code=True)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        args.model_name_or_path,
+        num_labels=2
+    )
     model = get_peft_model(model, peft_config)
     model.to(args.device)
 

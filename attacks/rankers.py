@@ -8,7 +8,7 @@ import heapq
 import random
 
 
-class RNNS_Ranker:
+class PSR_Ranker:
     def __init__(self, model_zoo, target_model: str, rename_fn):
         self.model_zoo = model_zoo
         self.target_model = target_model
