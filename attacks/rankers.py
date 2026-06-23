@@ -58,7 +58,7 @@ class PSR_Ranker:
 
         codes_to_predict = [task[2] for task in mutation_tasks]
         all_probs = []
-        BATCH_SIZE = 16
+        BATCH_SIZE = 128
 
         for i in range(0, len(codes_to_predict), BATCH_SIZE):
             chunk = codes_to_predict[i:i + BATCH_SIZE]

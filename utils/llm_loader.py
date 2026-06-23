@@ -1,90 +1,61 @@
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+import requests
+import concurrent.futures
+
 
 class LocalLLMClient:
-    def __init__(self, model_name="Qwen/Qwen2.5-1.5B-Instruct"):
-        # Initializes the local LLM client with quantization and tokenizer setups.
-        print(f"[*] Initializing local LLM generator ({model_name})...")
+    def __init__(self, model_name="qwen3.6:latest", host="http://localhost:11434"):
+        self.model_name = model_name
+        self.host = host
+        print(f"[*] Initializing local LLM generator via Ollama ({self.model_name}) on {self.host}...")
 
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4"
-        )
+        try:
+            resp = requests.get(f"{self.host}/api/tags", timeout=5)
+            resp.raise_for_status()
+            models = [m['name'] for m in resp.json().get('models', [])]
+            if self.model_name not in models:
+                print(
+                    f"[!] Warning: Model '{self.model_name}' not found. Please run `OLLAMA_HOST=127.0.0.1:11435 ollama pull {self.model_name}`.")
+            else:
+                print(f"[*] Ollama connection successful. Model '{self.model_name}' is ready.")
+        except Exception as e:
+            print(f"[!] CRITICAL: Error connecting to Ollama at {self.host}. Error: {e}")
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        self.tokenizer.padding_side = 'left'
-
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-
-        attn_impl = "sdpa"
-
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            quantization_config=bnb_config,
-            device_map="auto",
-            trust_remote_code=True,
-            attn_implementation=attn_impl
-        )
-        self.model.eval()
-
-        self.model.config.pad_token_id = self.tokenizer.pad_token_id
-
-    @torch.no_grad()
     def chat(self, prompt: str) -> str:
-        # Performs a single chat turn with low latency optimization.
-        messages = [
-            {"role": "system", "content": "You are a precise coding assistant. Output ONLY a comma-separated list of alternative variable names. No explanations."},
-            {"role": "user", "content": prompt}
-        ]
-        text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = self.tokenizer(text, return_tensors="pt").to(self.model.device)
+        system_prompt = "You are a precise coding assistant. Output ONLY a comma-separated list of alternative variable names. No explanations."
 
-        outputs = self.model.generate(
-            **inputs,
-            max_new_tokens=256,
-            temperature=0.6,
-            top_p=0.9,
-            do_sample=True,
-            pad_token_id=self.tokenizer.pad_token_id,
-            eos_token_id=self.tokenizer.eos_token_id
-        )
+        payload = {
+            "model": self.model_name,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt}
+            ],
+            "stream": False,
+            "options": {
+                "temperature": 0.85,
+                "top_p": 0.95,
+                "num_predict": 256
+            }
+        }
 
-        input_len = inputs.input_ids.shape[1]
-        response = self.tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
-        return response
+        try:
+            response = requests.post(f"{self.host}/api/chat", json=payload, timeout=300)
+            response.raise_for_status()
+            return response.json()['message']['content'].strip()
+        except Exception as e:
+            # 这样就能清楚地看到 Ollama 到底在抱怨什么了
+            print(f"[!] Ollama HTTP Error {e.response.status_code}: {e.response.text}")
+            return ""
 
-    @torch.no_grad()
     def batch_chat(self, prompts: list[str]) -> list[str]:
-        # Performs batch chat inference utilizing parallel processing.
         if not prompts:
             return []
 
-        texts = []
-        for prompt in prompts:
-            messages = [
-                {"role": "system", "content": "You are a precise coding assistant. Output ONLY a comma-separated list of alternative variable names. No explanations."},
-                {"role": "user", "content": prompt}
-            ]
-            texts.append(self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True))
-
-        inputs = self.tokenizer(texts, return_tensors="pt", padding=True).to(self.model.device)
-
-        outputs = self.model.generate(
-            **inputs,
-            max_new_tokens=400,
-            temperature=0.85,
-            top_p=0.95,
-            do_sample=True,
-            pad_token_id=self.tokenizer.pad_token_id,
-            eos_token_id=self.tokenizer.eos_token_id
-        )
+        # ⚠️ 注意这里：最大并发数对齐我们刚才设置的 OLLAMA_NUM_PARALLEL=6
+        max_workers = min(6, len(prompts))
 
         responses = []
-        input_len = inputs.input_ids.shape[1]
-        for output in outputs:
-            responses.append(self.tokenizer.decode(output[input_len:], skip_special_tokens=True).strip())
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            results = executor.map(self.chat, prompts)
+            responses = list(results)
 
         return responses

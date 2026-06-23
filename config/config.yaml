@@ -7,7 +7,7 @@ global:
 run_params:
   samples: 300
   # Path to the input dataset in Parquet format.
-  dataset: "./data/test.parquet"
+  dataset: "./data/alert/test.parquet"
   # Path to the JSON file mapping integer IDs to string labels(only used in "multi" mode).
   label_map: "./models/finetuned_model_codebert_1/label_map.json"
   # Number of classification classes.
@@ -17,12 +17,12 @@ models:
   # HuggingFace ID or local path for the Masked Language Model (used for embeddings and lightweight generation).
   mlm_engine: "microsoft/codebert-base-mlm"
   # Local path or ID for the LLM used to generate deep semantic replacements.
-  llm_generator: "Qwen/Qwen2.5-Coder-1.5B-Instruct"
+  llm_generator: "qwen3.5:9b"
   # Dictionary of target classification models to attack.
   target_models:
-    CodeBERT: "./models/CodeBERT_best_f1"
+    CodeBERT: "./models/ALERT_CodeBERT"
     # GraphCodeBERT: "./models/binary_diversevul_graphcodebert"
-    UniXcoder: "./models/UniXcoder_best_f1"
+#    UniXcoder: "./models/UniXcoder_best_f1"
 
 candidate_generation:
   # Whether to strictly maintain the original naming style (e.g., camelCase, snake_case).
