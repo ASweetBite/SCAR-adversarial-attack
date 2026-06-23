@@ -13,3 +13,4 @@ peft
 scikit-learn
 tqdm
 typing-extensions
+Levenshtein

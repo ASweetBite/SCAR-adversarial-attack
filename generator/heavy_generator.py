@@ -19,7 +19,6 @@ class HeavyWeightCandidateGenerator:
         self.scorer = StatisticalNamingScorer(stats_path)
 
     def _detect_naming_style(self, name: str) -> str:
-        # Detects the naming convention style of the given identifier name.
         if not name:
             return 'unknown'
         core_name = name.strip('_')
@@ -39,7 +38,6 @@ class HeavyWeightCandidateGenerator:
         return 'unknown'
 
     def _matches_style(self, original_style: str, candidate: str) -> bool:
-        # Verifies if the candidate identifier matches the expected original styling.
         cand_style = self._detect_naming_style(candidate)
         if original_style in ('snake_case', 'camelCase', 'PascalCase') and cand_style == 'single_lower': return True
         if original_style == 'single_lower' and cand_style in ('snake_case', 'camelCase'): return True
@@ -47,7 +45,6 @@ class HeavyWeightCandidateGenerator:
         return cand_style == original_style
 
     def _split_identifier(self, name: str):
-        # Splits snake_case or camelCase identifiers into individual token parts.
         if '_' in name:
             return name.split('_'), '_'
         else:
@@ -57,11 +54,6 @@ class HeavyWeightCandidateGenerator:
 
     def _extract_local_context_ast(self, code_bytes: bytes, target_start: int, target_end: int, tree) -> tuple[
         str, str]:
-        # Extracts neighboring syntax fragments surrounding the target variable from AST.
-        # from tree_sitter import Parser
-        # parser = Parser()
-        # parser.language = self.analyzer.language
-        # tree = parser.parse(code_bytes)
         node = tree.root_node.descendant_for_byte_range(target_start, target_end)
 
         if not node:
@@ -91,7 +83,6 @@ class HeavyWeightCandidateGenerator:
 
         for i in range(search_limit):
             occ = occurrences[i]
-            # 传入 tree
             local_prefix, local_suffix = self._extract_local_context_ast(code_bytes, occ['start'], occ['end'], tree)
             score = len(local_prefix) + len(local_suffix)
             if '(' in local_suffix or ',' in local_suffix: score += 100
@@ -102,9 +93,9 @@ class HeavyWeightCandidateGenerator:
                 best_idx = i
         return best_idx
 
+    # [!] OPTIMIZATION: batch_size 从 64 提升至 1024，大幅缩短大规模向量相似度计算耗时
     def _get_variable_token_embeddings(self, prefixes: List[str], var_names: List[str], suffixes: List[str],
-                                       batch_size: int = 64) -> torch.Tensor:
-        # Generates token-level embeddings for variables within their syntax contexts.
+                                       batch_size: int = 1024) -> torch.Tensor:
         all_embeddings = []
         tokenizer = self.embedder.tokenizer
         full_texts = [p + v + s for p, v, s in zip(prefixes, var_names, suffixes)]
@@ -145,7 +136,6 @@ class HeavyWeightCandidateGenerator:
         return torch.stack(all_embeddings)
 
     def _verify_ast_single(self, cand: str, ctx: dict) -> str | None:
-        # Performs isolated AST syntax renaming check for a candidate name.
         if not self.analyzer.can_rename_to(ctx['code_bytes'], ctx['target_name'], cand):
             return None
         try:
@@ -157,7 +147,6 @@ class HeavyWeightCandidateGenerator:
             return None
 
     def _is_trivial_change(self, target_name: str, cand: str) -> bool:
-        # Checks if the candidate is a trivial change from the target variable.
         target_parts, _ = self._split_identifier(target_name)
         cand_parts, _ = self._split_identifier(cand)
         if len(target_parts) > 2 and len(cand_parts) > 0:
@@ -167,17 +156,16 @@ class HeavyWeightCandidateGenerator:
         return False
 
     def _verify_and_filter(self, candidate_list, quota, final_candidates, ctx):
-        # Filters candidates using semantic similarity thresholds, syntactic heuristic scores, and AST renaming verification.
         base_threshold = ctx.get('semantic_threshold', 0.85)
         entity_type = ctx.get('entity_type', 'VARIABLE')
 
         base_cands = []
         for cand in candidate_list:
             if cand in ctx['keywords'] or cand == ctx['target_name']:
-                print(f"        🚫 [Filter | Keyword/Self] '{cand}'")
+                # print(f"        🚫 [Filter | Keyword/Self] '{cand}'")
                 continue
             if ctx['preserve_style'] and not self._matches_style(ctx['original_style'], cand):
-                print(f"        🚫 [Filter | Style Clash] '{cand}' (Expected: {ctx['original_style']})")
+                # print(f"        🚫 [Filter | Style Clash] '{cand}' (Expected: {ctx['original_style']})")
                 continue
             base_cands.append(cand)
 
@@ -245,8 +233,116 @@ class HeavyWeightCandidateGenerator:
 
         return added
 
-    def _build_llm_prompt(self, context_code: str, target_name: str, style: str, top_n: int, entity_type: str, n_parts: int) -> str:
-        # Formulates a strict, JSON-enforced instructions prompt for candidate generation.
+    def _parse_single_json_response(self, response: str) -> List[str]:
+        """解析单任务数组返回结构"""
+        if not response: return []
+        clean_text = response.replace("```json", "").replace("```", "").strip()
+
+        # 尝试修补因为 Prompt 结尾是 `[` 导致的不完整 JSON
+        patched_json = f"[{clean_text}"
+        if not patched_json.endswith(']'): patched_json += "]"
+        try:
+            parsed = json.loads(patched_json)
+            if isinstance(parsed, list): return [str(x) for x in parsed]
+        except Exception:
+            pass
+
+        # 降级到原有的正则表达式兜底逻辑
+        first_quote, last_quote = clean_text.find('"'), clean_text.rfind('"')
+        if first_quote != -1 and last_quote != -1 and first_quote != last_quote:
+            patched_json = f"[{clean_text[first_quote:last_quote + 1]}]"
+            try:
+                parsed_cands = json.loads(patched_json)
+                if isinstance(parsed_cands, list): return [str(x) for x in parsed_cands]
+            except Exception:
+                pass
+
+        return re.findall(r'["\']([a-zA-Z0-9_]+)["\']', response)
+
+    def _parse_multi_json_response(self, response: str) -> Dict[str, List[str]]:
+        """解析多任务字典返回结构"""
+        if not response: return {}
+        clean_text = response.replace("```json", "").replace("```", "").strip()
+
+        # 尝试修补因为 Prompt 结尾是 `{` 导致的不完整 JSON
+        patched_json = f"{{{clean_text}"
+        if not patched_json.endswith('}'): patched_json += "}"
+        try:
+            parsed = json.loads(patched_json)
+            if isinstance(parsed, dict):
+                return {str(k): [str(x) for x in v] if isinstance(v, list) else [] for k, v in parsed.items()}
+        except Exception:
+            pass
+
+        # 如果 LLM 固执地输出了完整的 { ... }
+        try:
+            start = clean_text.find('{')
+            end = clean_text.rfind('}')
+            if start != -1 and end != -1:
+                parsed = json.loads(clean_text[start:end+1])
+                if isinstance(parsed, dict):
+                    return {str(k): [str(x) for x in v] if isinstance(v, list) else [] for k, v in parsed.items()}
+        except Exception:
+            pass
+
+        return {}
+
+    def _build_multi_llm_prompt(self, meta_group: List[Dict], top_n: int) -> str:
+        """为同时预测多个变量构建 Prompt"""
+        prompt = f"You are an expert C/C++ developer. Suggest exactly {top_n} alternative names for MULTIPLE variables.\n\n"
+        example_dict = {}
+
+        for idx, meta in enumerate(meta_group, 1):
+            target_name = meta['target_name']
+            style = meta['original_style']
+            entity_type = meta['entity_type']
+            n_parts = meta['n_parts']
+
+            if style == 'camelCase':
+                ex_var, ex_bool, ex_func, ex_short = "dataBuffer", "'isReady', 'hasData'", "'getData', 'updateState'", "'shmInfo', 'memData', 'idx'"
+            elif style == 'PascalCase':
+                ex_var, ex_bool, ex_func, ex_short = "DataBuffer", "'IsReady', 'HasData'", "'GetData', 'UpdateState'", "'ShmInfo', 'MemData', 'Idx'"
+            elif style == 'SCREAMING_SNAKE':
+                ex_var, ex_bool, ex_func, ex_short = "DATA_BUFFER", "'IS_READY', 'HAS_DATA'", "'GET_DATA', 'UPDATE_STATE'", "'SHM_INFO', 'MEM_DATA', 'IDX'"
+            else:
+                ex_var, ex_bool, ex_func, ex_short = "data_buffer", "'is_ready', 'has_data'", "'get_data', 'update_state'", "'shm_info', 'mem_data', 'idx'"
+
+            if entity_type == 'VARIABLE':
+                entity_rule = f"Use NOUNS only (e.g., '{ex_var}'). NO verbs."
+            elif entity_type == 'BOOLEAN_VAR':
+                entity_rule = f"Use BOOLEAN prefixes (e.g., {ex_bool})."
+            else:
+                entity_rule = f"Use ACTION VERBS (e.g., {ex_func})."
+
+            leading_us_rule = ""
+            if target_name.startswith('_'):
+                leading_us_rule = " PRESERVE PREFIX: Original name starts with '_'. ALL suggestions MUST start with '_'."
+
+            if n_parts <= 2:
+                strategy = f"Short & Concise (max {n_parts + 1} words, e.g., {ex_short})"
+            else:
+                strategy = "Semantic Refactoring (professional synonyms matching original length)"
+
+            prompt += f"[Task {idx}: `{target_name}`]\n"
+            prompt += f"- Code Context:\n```c\n{meta['slice_code_str']}\n```\n"
+            prompt += f"- Strict Rules: STYLE: {style}. {leading_us_rule} | {entity_rule} | {strategy}\n\n"
+
+            example_dict[target_name] = [f"cand{i}" for i in range(1, top_n + 1)]
+
+        example_json = json.dumps(example_dict, indent=2)
+
+        prompt += f"""[Output Task]
+Output ONLY a JSON Object. Keys are original target variable names, values are arrays of {top_n} strings. No explanations.
+Example format:
+{example_json}
+
+JSON
+{{"""
+        return prompt
+
+
+    def _build_llm_prompt(self, context_code: str, target_name: str, style: str, top_n: int, entity_type: str,
+                          n_parts: int) -> str:
         if style == 'camelCase':
             ex_var = "dataBuffer"
             ex_bool = "'isReady', 'hasData'"
@@ -308,22 +404,23 @@ Example format for {top_n} items: ["name1", "name2", "name3", ...]
 JSON
 ["""
 
-    def generate_candidates(self, vulnerable_tasks: List[Dict[str, Any]], target_quota: int = 20) -> Dict[str, List[str]]:
-        # Generates deep semantic naming candidates for target entities using LLM and vector constraints.
+    def generate_candidates(self, vulnerable_tasks: List[Dict[str, Any]], target_quota: int = 20) -> Dict[
+        str, List[str]]:
         results = {task["target_name"]: [] for task in vulnerable_tasks}
+        task_metadata = []
 
-        llm_prompts = []
-        task_metadata = {}
         from tree_sitter import Parser
         parser = Parser()
         parser.language = self.analyzer.language
+
+        # 1. 解析任务和提取上下文
         for task_idx, task in enumerate(vulnerable_tasks):
             target_name = task["target_name"]
-
             slice_code_str = task["code_str"]
             slice_code_bytes = slice_code_str.encode("utf-8")
             tree = parser.parse(slice_code_bytes)
             slice_identifiers = self.analyzer.extract_identifiers(slice_code_bytes)
+
             if target_name not in slice_identifiers:
                 continue
 
@@ -346,56 +443,90 @@ JSON
             prefix_str = local_prefix[-MAX_CHAR_LIMIT:] if len(local_prefix) > MAX_CHAR_LIMIT else local_prefix
             suffix_str = local_suffix[:MAX_CHAR_LIMIT] if len(local_suffix) > MAX_CHAR_LIMIT else local_suffix
 
-            task_metadata[task_idx] = {
+            task_metadata.append({
                 "target_name": target_name, "parts": parts, "style": style, "n_parts": len(parts),
                 "entity_type": entity_type, "original_style": original_style,
+                "slice_code_str": slice_code_str,  # 保留字符串用于 Prompt 构建
 
                 "full_code_str": task["full_code_str"],
                 "full_code_bytes": task["full_code_str"].encode("utf-8"),
                 "full_identifiers": task.get("full_identifiers", slice_identifiers),
 
                 "local_prefix": prefix_str, "local_suffix": suffix_str
-            }
+            })
 
-            prompt = self._build_llm_prompt(slice_code_str, target_name, original_style, int(target_quota * 1.5), entity_type,
-                                            len(parts))
-            llm_prompts.append(prompt)
+        if not task_metadata: return results
 
-        if not llm_prompts: return results
+        # 2. 构建 Prompts (分流逻辑: 多任务合并 vs 单任务)
+        raw_candidates_dict = {meta["target_name"]: [] for meta in task_metadata}
+        llm_prompts = []
 
-        try:
-            llm_responses = self.llm_client.batch_chat(llm_prompts)
-        except Exception as e:
-            print(f"[!] LLM Batch Chat Failed: {e}")
-            llm_responses = [""] * len(llm_prompts)
+        GROUPING_THRESHOLD = 10
+        GROUP_SIZE = 5  # 每 5 个变量打包成 1 次 API 调用，兼顾上下文窗口长度和效率
 
-        for resp_idx, response in enumerate(llm_responses):
-            meta = task_metadata[resp_idx]
-            parsed_cands = []
+        if target_quota <= GROUPING_THRESHOLD:
+            # === 打包请求模式 (降低 API 调用频率) ===
+            grouped_metas = [task_metadata[i:i + GROUP_SIZE] for i in range(0, len(task_metadata), GROUP_SIZE)]
+            for group in grouped_metas:
+                prompt = self._build_multi_llm_prompt(group, int(target_quota * 1.5))
+                llm_prompts.append(prompt)
 
-            leading_m = re.match(r'^_+', meta["target_name"])
+            if llm_prompts:
+                try:
+                    llm_responses = self.llm_client.batch_chat(llm_prompts)
+                except Exception as e:
+                    print(f"[!] LLM Batch Chat Failed: {e}")
+                    llm_responses = [""] * len(llm_prompts)
+
+                for resp, group in zip(llm_responses, grouped_metas):
+                    parsed_dict = self._parse_multi_json_response(resp)
+                    for meta in group:
+                        t_name = meta["target_name"]
+                        # 处理可能的键值大小写偏差
+                        raw_cands = parsed_dict.get(t_name)
+                        if raw_cands is None:
+                            for k, v in parsed_dict.items():
+                                if k.lower() == t_name.lower():
+                                    raw_cands = v
+                                    break
+                        raw_candidates_dict[t_name] = raw_cands or []
+
+        else:
+            # === 原有高精度单任务模式 ===
+            for meta in task_metadata:
+                prompt = self._build_llm_prompt(
+                    meta["slice_code_str"], meta["target_name"], meta["original_style"],
+                    int(target_quota * 1.5), meta["entity_type"], meta["n_parts"]
+                )
+                llm_prompts.append(prompt)
+
+            if llm_prompts:
+                try:
+                    llm_responses = self.llm_client.batch_chat(llm_prompts)
+                except Exception as e:
+                    print(f"[!] LLM Batch Chat Failed: {e}")
+                    llm_responses = [""] * len(llm_prompts)
+
+                for resp, meta in zip(llm_responses, task_metadata):
+                    raw_candidates_dict[meta["target_name"]] = self._parse_single_json_response(resp)
+
+        # 3. 后处理与 AST/语义校验 (对这两种模式获取的结果进行统一清洗)
+        cg_cfg = self.config.get('candidate_generation', {})
+        hw_cfg = cg_cfg.get('heavyweight', {})
+
+        for meta in task_metadata:
+            t_name = meta["target_name"]
+            parsed_cands = raw_candidates_dict[t_name]
+
+            leading_m = re.match(r'^_+', t_name)
             leading_us = leading_m.group(0) if leading_m else ""
-
-            if response and isinstance(response, str):
-                clean_text = response.replace("```json", "").replace("```", "").strip()
-                first_quote, last_quote = clean_text.find('"'), clean_text.rfind('"')
-
-                if first_quote != -1 and last_quote != -1 and first_quote != last_quote:
-                    patched_json = f"[{clean_text[first_quote:last_quote + 1]}]"
-                    try:
-                        parsed_cands = json.loads(patched_json)
-                        if not isinstance(parsed_cands, list): parsed_cands = [str(parsed_cands)]
-                    except Exception:
-                        pass
-
-                if not parsed_cands:
-                    parsed_cands = re.findall(r'["\']([a-zA-Z0-9_]+)["\']', response)
 
             valid_cands, oversized_cands = [], []
             for c in parsed_cands:
                 if isinstance(c, str) and c.strip():
                     clean_cand = c.strip()
 
+                    # 规范化前导下划线
                     if leading_us and not clean_cand.startswith(leading_us):
                         clean_cand = leading_us + clean_cand.lstrip('_')
                     elif not leading_us and clean_cand.startswith('_'):
@@ -415,13 +546,10 @@ JSON
             if len(valid_cands) < min_threshold and oversized_cands:
                 valid_cands.extend(oversized_cands[:min_threshold - len(valid_cands)])
 
-            cg_cfg = self.config.get('candidate_generation', {})
-            hw_cfg = cg_cfg.get('heavyweight', {})
-
             ctx = {
                 'code_bytes': meta["full_code_bytes"],
                 'full_code_str': meta["full_code_str"],
-                'target_name': meta["target_name"],
+                'target_name': t_name,
                 'identifiers': meta["full_identifiers"],
                 'keywords': self.analyzer.keywords,
                 'original_style': meta["original_style"],
@@ -433,12 +561,12 @@ JSON
 
                 'entity_type': meta["entity_type"],
                 'return_type': next(
-                    (u['return_type'] for u in meta["full_identifiers"].get(meta["target_name"], []) if
+                    (u['return_type'] for u in meta["full_identifiers"].get(t_name, []) if
                      u.get('return_type')), None),
             }
 
             final_candidates = []
             self._verify_and_filter(valid_cands, target_quota, final_candidates, ctx)
-            results[meta["target_name"]] = final_candidates
+            results[t_name] = final_candidates
 
         return results

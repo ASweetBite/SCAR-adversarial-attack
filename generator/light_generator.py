@@ -253,7 +253,7 @@ class LightweightCandidateGenerator:
         return words
 
     def _get_variable_token_embeddings(self, prefixes: List[str], var_names: List[str], suffixes: List[str],
-                                       batch_size: int = 64) -> torch.Tensor:
+                                       batch_size: int = 1024) -> torch.Tensor:
         # Extracts contextual token embeddings representing variable semantics.
         all_embeddings = []
         tokenizer = self.mlm_engine.tokenizer

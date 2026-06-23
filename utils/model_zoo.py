@@ -298,7 +298,7 @@ class ModelZoo:
 
         return probs, pred_label
 
-    def batch_predict(self, codes: List[str], target_model: str, batch_size: int = 32) -> Tuple[
+    def batch_predict(self, codes: List[str], target_model: str, batch_size: int = 128) -> Tuple[
         List[List[float]], List[int]]:
         """安全的 Batch Predict: 兼容各种非标准架构的特征重组"""
         m = self.models.get(target_model)
