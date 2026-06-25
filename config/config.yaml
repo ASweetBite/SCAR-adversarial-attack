@@ -17,7 +17,7 @@ models:
   # HuggingFace ID or local path for the Masked Language Model (used for embeddings and lightweight generation).
   mlm_engine: "microsoft/codebert-base-mlm"
   # Local path or ID for the LLM used to generate deep semantic replacements.
-  llm_generator: "qwen3.5:9b"
+  llm_generator: "qwen3-coder-next:latest"
   # Dictionary of target classification models to attack.
   target_models:
     CodeBERT: "./models/ALERT_CodeBERT"
@@ -37,14 +37,14 @@ candidate_generation:
     # Maximum number of valid candidates to retain after filtering.
     top_n_keep: 50
     # Cosine similarity threshold for semantic consistency.
-    semantic_threshold: 0.87
+    semantic_threshold: 0.65
 
   # --- Heavyweight (LLM) specific configurations ---
   heavyweight:
     # Target number of candidates to generate/retain using the LLM.
     top_m: 25
     # Cosine similarity threshold for LLM-generated candidates.
-    semantic_threshold: 0.87
+    semantic_threshold: 0.65
 
 attack:
   # The optimization algorithm to use: 'greedy', 'beam', or 'ga' (Genetic Algorithm).

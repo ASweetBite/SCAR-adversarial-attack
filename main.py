@@ -10,6 +10,7 @@ from attacks.scar_attacker import SCARAttacker
 from generator.light_generator import LightweightCandidateGenerator
 from utils.ast_tools import IdentifierAnalyzer, CodeTransformer
 from utils.dataset_loader import DatasetLoader
+from utils.embedder import CodeEmbedder
 from utils.llm_loader import LocalLLMClient
 from utils.miner import NamingDataMiner
 from utils.mlm_engine import MLMEngine
@@ -42,18 +43,19 @@ def main(args, config):
     mlm_engine_name = config['models'].get('mlm_engine', 'microsoft/codebert-base-mlm')
     mlm_engine = MLMEngine(mlm_engine_name)
 
-    llm_name = config['models'].get('llm_generator', 'models/qwen2.5-1.5b-code')
+    llm_name = config['models'].get('llm_generator', 'qwen3.5:9b')
     llm_client = LocalLLMClient(model_name=llm_name)
+    code_embedder = CodeEmbedder(model_name="microsoft/unixcoder-base")
 
     lightweight_generator = LightweightCandidateGenerator(
         mlm_engine=mlm_engine,
+        embedder=code_embedder,
         analyzer=analyzer,
         config=config,
-        llm_client=llm_client,
     )
 
     heavyweight_generator = HeavyWeightCandidateGenerator(
-        embedder=mlm_engine,
+        embedder=code_embedder,
         llm_client=llm_client,
         analyzer=analyzer,
         config=config

@@ -1,18 +1,15 @@
 # analyze_rename_stealthiness.py
 # -*- coding: utf-8 -*-
 
-import argparse
-import json
-import os
 import re
-import csv
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 
-import pandas as pd
 import matplotlib.pyplot as plt
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from utils.embedder import CodeEmbedder
 
 KEYWORDS = set("""
 auto break case char const continue default do double else enum extern float for goto if inline int long
@@ -525,27 +522,82 @@ import json
 import argparse
 import yaml
 import torch
+import math
 import torch.nn.functional as F
 import pandas as pd
 import numpy as np
 
-# Import native modules from your project
+# 导入你项目中的原生模块
 from utils.ast_tools import IdentifierAnalyzer
-from utils.llm_loader import LocalLLMClient
 from utils.mlm_engine import MLMEngine
 from generator.light_generator import LightweightCandidateGenerator
+
+
+class PPLCalculator:
+    """独立的 PPL 评估器，专用于代码隐蔽性/自然度分析"""
+
+    def __init__(self, model_name_or_path="Qwen/Qwen2.5-0.5B-Coder", device="cuda"):
+        print(f"[*] Initializing standalone PPL Calculator with {model_name_or_path}...")
+        self.device = device if torch.cuda.is_available() else "cpu"
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+
+        # 兼容没有默认 padding token 的模型（如 Qwen, GPT-2）
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name_or_path,
+            torch_dtype=torch.float16,  # 使用半精度节省显存
+            device_map=self.device
+        )
+        self.model.eval()
+
+    @torch.no_grad()
+    def calculate_batch(self, texts: list[str], batch_size: int = 4) -> list[float]:
+        if not texts:
+            return []
+        ppls = []
+        for i in range(0, len(texts), batch_size):
+            batch_texts = texts[i:i + batch_size]
+            inputs = self.tokenizer(
+                batch_texts, return_tensors="pt", padding=True, truncation=True, max_length=1024
+            ).to(self.device)
+
+            outputs = self.model(input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"])
+
+            shift_logits = outputs.logits[..., :-1, :].contiguous()
+            shift_labels = inputs["input_ids"][..., 1:].contiguous()
+            shift_mask = inputs["attention_mask"][..., 1:].contiguous()
+
+            loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
+            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            loss = loss.view(shift_labels.size(0), shift_labels.size(1)) * shift_mask
+
+            seq_lens = torch.clamp(shift_mask.sum(dim=1), min=1.0)
+            seq_loss = loss.sum(dim=1) / seq_lens
+
+            for val in seq_loss:
+                try:
+                    ppls.append(math.exp(val.item()))
+                except OverflowError:
+                    ppls.append(float('inf'))
+
+            del inputs, outputs, loss
+            torch.cuda.empty_cache()
+
+        return ppls
 
 
 def normalize_code(code: str) -> str:
     if not isinstance(code, str) or not code:
         return ""
 
-    # 1. Fix double escaping caused by faulty dumps (restore literal \n to actual newlines)
-    # If there are no real newlines but literal "\n" exists, it was double-escaped
+    # 1. 修复由于错误 dump 导致的双重转义 (把字面的 \n 恢复成真正的换行)
+    # 如果代码里连一个真正的换行符都没有，但有文本 "\n"，说明它被双重转义了
     if '\n' not in code and '\\n' in code:
         code = code.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
 
-    # 2. Unify Windows (\r\n) and UNIX (\n) newlines to prevent SequenceMatcher misjudgments due to hidden \r
+    # 2. 统一 Windows (\r\n) 和 UNIX (\n) 换行符，防止 SequenceMatcher 因为看不见的 \r 误判
     code = code.replace("\r\n", "\n").replace("\r", "\n")
 
     return code
@@ -563,9 +615,6 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
 
-    # =========================================================================
-    # 1. Initialize Engines and Configs (Strictly aligned with the main attack program)
-    # =========================================================================
     print(f"[*] Loading config from {args.config}...")
     with open(args.config, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
@@ -574,30 +623,27 @@ def main():
     lang = config.get('global', {}).get('lang', 'cpp')
     analyzer = IdentifierAnalyzer(lang=lang)
 
-    mlm_engine_name = config['models'].get('mlm_engine', 'Qwen/Qwen2.5-Coder-1.5B-Instruct')
+    ppl_model_name = config['models'].get('llm_generator', 'Qwen/Qwen2.5-1.5B-Coder')
+    ppl_calculator = PPLCalculator(model_name_or_path=ppl_model_name)
+
+    mlm_engine_name = config['models'].get('mlm_engine', 'microsoft/codebert-base-mlm')
     mlm_engine = MLMEngine(mlm_engine_name)
 
-    llm_name = config['models'].get('llm_generator', 'models/qwen2.5-1.5b-code')
-    llm_client = LocalLLMClient(model_name=llm_name)
+    code_embedder = CodeEmbedder(model_name="microsoft/unixcoder-base")
 
-    # Instantiate the Generator, reusing its feature pooling and AST cropping functions
     mlm_gen = LightweightCandidateGenerator(
         mlm_engine=mlm_engine,
         analyzer=analyzer,
         config=config,
-        llm_client=llm_client,
+        embedder=code_embedder
     )
 
-    # =========================================================================
-    # 2. Read and Parse Sample Records, Extracting Precise AST Context
-    # =========================================================================
     print(f"\n[*] Loading records from {args.input_json}...")
     records = load_json_records(args.input_json)
 
     all_metrics = []
     all_mapping_rows = []
 
-    # Feature storage pools for batch calculations
     sim_prefixes, sim_orig_vars, sim_adv_vars, sim_suffixes, sim_record_indices = [], [], [], [], []
     ppl_orig_codes, ppl_adv_codes, ppl_record_indices = [], [], []
 
@@ -605,45 +651,41 @@ def main():
     for idx, record in enumerate(records):
         sample_id = record.get(args.sample_id_field, idx) if args.sample_id_field else idx
 
-        # 1. Data cleaning (retaining previous patches)
         orig_code = normalize_code(record.get("original_code", ""))
         adv_code = normalize_code(record.get("adversarial_code", ""))
         record["original_code"] = orig_code
         record["adversarial_code"] = adv_code
 
-        # 2. Strictly read the true is_success from the dataset
         is_success = record.get("is_success", False)
         if isinstance(is_success, str):
             is_success = (is_success.lower() == 'true')
 
-        # Existing basic structural metric analysis
         metrics, mapping_rows = analyze_one_record(record, sample_id)
 
-        # Forcefully record the actual attack result into the metrics of this entry
         metrics["is_success"] = is_success
 
-        # Initialize deep learning metrics
         metrics.update({
             "semantic_similarity": np.nan, "orig_ppl": np.nan,
             "adv_ppl": np.nan, "ppl_ratio": np.nan, "ppl_diff": np.nan
         })
 
-        # 3. Only calculate semantic shift for samples that are truly evaluated as successful
         if is_success and orig_code and adv_code and orig_code != adv_code:
             ppl_orig_codes.append(orig_code)
             ppl_adv_codes.append(adv_code)
             ppl_record_indices.append(idx)
 
-            # Strict alignment filtering logic for context slicing
             orig_bytes = orig_code.encode("utf-8")
             identifiers = analyzer.extract_identifiers(orig_bytes)
 
-            # Automatically infer replaced_names: if not provided by JSON, dynamically derive using the script's Token alignment results
+            from tree_sitter import Parser
+            parser = Parser()
+            parser.language = analyzer.language
+            tree = parser.parse(orig_bytes)
+
             replaced_names = record.get("replaced_names")
             if not replaced_names:
                 replaced_names = {}
                 for row in mapping_rows:
-                    # mapping_rows contains the modification records calculated earlier by analyze_one_record
                     old_name = row["old_identifier"]
                     new_name = row["new_identifier"]
                     replaced_names[old_name] = new_name
@@ -652,13 +694,11 @@ def main():
                 old_var, new_var = str(old_var), str(new_var)
                 if old_var in identifiers and old_var != new_var:
                     try:
-                        # Find the context with the highest information content (exact match)
-                        best_occ_idx = mlm_gen._find_best_context_occurrence(orig_bytes, identifiers[old_var])
+                        best_occ_idx = mlm_gen._find_best_context_occurrence(orig_bytes, identifiers[old_var], tree)
                         target_info = identifiers[old_var][best_occ_idx]
 
-                        # Extract statement-level safe slices (exact match)
                         local_prefix, local_suffix = mlm_gen._extract_local_context_ast(
-                            orig_bytes, target_info['start'], target_info['end']
+                            orig_bytes, target_info['start'], target_info['end'], tree
                         )
 
                         sim_prefixes.append(local_prefix)
@@ -667,7 +707,7 @@ def main():
                         sim_suffixes.append(local_suffix)
                         sim_record_indices.append(idx)
                     except Exception as e:
-                        print(f"        [!] Error parsing variable context {old_var}->{new_var}: {e}")
+                        print(f"        [!] 解析变量上下文出错 {old_var}->{new_var}: {e}")
                         continue
         else:
             metrics.update({"semantic_similarity": np.nan, "orig_ppl": np.nan, "adv_ppl": np.nan, "ppl_ratio": np.nan, "ppl_diff": np.nan})
@@ -675,11 +715,13 @@ def main():
         all_metrics.append(metrics)
         all_mapping_rows.extend(mapping_rows)
 
+
     if ppl_orig_codes:
         ppl_bs = config.get('candidate_generation', {}).get('ppl_batch_size', 4)
         print(f"\n[*] Calculating Strict Perplexity for {len(ppl_orig_codes)} samples (Batch Size: {ppl_bs})...")
-        batch_orig_ppls = mlm_gen._calculate_perplexity_batch(ppl_orig_codes, batch_size=ppl_bs)
-        batch_adv_ppls = mlm_gen._calculate_perplexity_batch(ppl_adv_codes, batch_size=ppl_bs)
+
+        batch_orig_ppls = ppl_calculator.calculate_batch(ppl_orig_codes, batch_size=ppl_bs)
+        batch_adv_ppls = ppl_calculator.calculate_batch(ppl_adv_codes, batch_size=ppl_bs)
 
         for i, global_idx in enumerate(ppl_record_indices):
             all_metrics[global_idx].update({
@@ -689,26 +731,21 @@ def main():
                 "ppl_ratio": float(batch_adv_ppls[i] / batch_orig_ppls[i]) if batch_orig_ppls[i] > 0 else float('inf')
             })
 
-    # =========================================================================
-    # 3. Batch Calculation of Semantic Similarity (Core Alignment Zone)
-    # =========================================================================
     if sim_prefixes:
         print(f"[*] Calculating Target-Aware Token Similarity for {len(sim_prefixes)} rename instances...")
 
-        # Use _get_variable_token_embeddings to get the mean pooled features of variables in statement slices
-        # This operation automatically includes Automatic Mixed Precision (AMP) and precise Token alignment
         orig_embs = mlm_gen._get_variable_token_embeddings(
-            sim_prefixes, sim_orig_vars, sim_suffixes, batch_size=64
-        ).to(mlm_engine.device)
+            sim_prefixes, sim_orig_vars, sim_suffixes, batch_size=1024
+        ).to(code_embedder.device)
 
         adv_embs = mlm_gen._get_variable_token_embeddings(
-            sim_prefixes, sim_adv_vars, sim_suffixes, batch_size=64
-        ).to(mlm_engine.device)
+            sim_prefixes, sim_adv_vars, sim_suffixes, batch_size=1024
+        ).to(code_embedder.device)
 
-        # Tensor broadcast cosine similarity calculation
+        # 完美的张量广播余弦相似度计算
         sims = F.cosine_similarity(orig_embs, adv_embs, dim=-1).cpu().numpy()
 
-        # Aggregate: If a sample replaces multiple different variables, take the average of their semantic similarities
+        # 聚合：如果一个样本替换了多个不同的变量，取其语义相似度的平均值
         sample_sim_accum = {}
         sample_sim_count = {}
         for i, global_idx in enumerate(sim_record_indices):
@@ -720,25 +757,25 @@ def main():
             all_metrics[global_idx]["semantic_similarity"] = float(avg_sim)
 
     # =========================================================================
-    # 4. Result Aggregation and Saving
+    # 4. 结果汇总与保存
     # =========================================================================
     metrics_df = pd.DataFrame(all_metrics)
     mapping_df = pd.DataFrame(all_mapping_rows)
     metrics_df.to_csv(os.path.join(args.out, "sample_metrics.csv"), index=False, encoding="utf-8-sig")
     mapping_df.to_csv(os.path.join(args.out, "identifier_renames.csv"), index=False, encoding="utf-8-sig")
 
-    # Core: Partition a DataFrame containing only successful samples
+    # 🚀 核心：划分出一个仅包含成功样本的 DataFrame
     if "is_success" in metrics_df.columns:
         success_df = metrics_df[metrics_df["is_success"] == True]
     else:
         success_df = metrics_df
 
-    # Calculate statistics (based on the strictly filtered success_df)
+    # 统计信息计算 (基于严格过滤的 success_df)
     summary = {
         "num_total_samples": int(len(metrics_df)),
         "num_successfully_changed_samples": int(len(success_df)),
         "success_rate": float(len(success_df) / max(len(metrics_df), 1)),
-        # Only count the number of rename pairs in successful samples
+        # 这里只统计成功样本中的重命名对数量
         "num_rename_pairs_in_success": int(success_df["changed_identifier_occurrences"].sum()) if not success_df.empty else 0,
     }
 
@@ -750,7 +787,7 @@ def main():
         "semantic_similarity", "orig_ppl", "adv_ppl", "ppl_ratio", "ppl_diff"
     ]
 
-    # Note: All mean and median calculations here are changed to use success_df
+    # 🚀 注意：这里所有的 mean, median 计算都改为了使用 success_df
     for col in numeric_columns:
         if col in success_df.columns and not success_df.empty:
             valid_series = success_df[col].replace([np.inf, -np.inf], np.nan).dropna()
@@ -766,7 +803,7 @@ def main():
     with open(summary_json, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
-    # Generate histogram charts
+    # 生成直方图图表
     if not metrics_df.empty and "semantic_similarity" in metrics_df.columns:
         save_histogram(
             metrics_df.dropna(subset=["semantic_similarity"]),
@@ -776,7 +813,7 @@ def main():
             "Similarity Score (1.0 = identical)"
         )
 
-    print(f"\n Final post-evaluation completed! {len(metrics_df)} samples analyzed successfully. Data saved to: {args.out}")
+    print(f"\n✅ 终极后置评估完成! {len(metrics_df)} 个样本成功分析。数据已保存至: {args.out}")
 
 if __name__ == "__main__":
     main()

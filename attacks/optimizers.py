@@ -340,9 +340,7 @@ class BeamSearchOptimizer:
         #   patience                : 连续若干 chunk 没有显著提升才早停
         # ==========================================================
         self.early_stop_delta = beam_cfg.get('early_stop_delta', 0.3)
-        self.early_stop_strategy = str(
-            beam_cfg.get('beam_early_stop_strategy', beam_cfg.get('early_stop_strategy', 'dynamic'))
-        ).lower()
+        self.early_stop_strategy = "none"
         self.early_stop_patience = int(beam_cfg.get('beam_early_stop_patience', 2))
         self.early_stop_min_valid_vars = int(beam_cfg.get('beam_early_stop_min_valid_vars', 3))
 

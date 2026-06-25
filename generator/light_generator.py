@@ -6,97 +6,13 @@ from typing import Dict, Any, List
 import torch
 import torch.nn.functional as F
 
+from generator.base_generator import BaseCandidateGenerator
 
-class LightweightCandidateGenerator:
-    def __init__(self, mlm_engine, analyzer, config, llm_client=None):
-        # Initializes the lightweight candidate generator with an MLM engine and optional LLM client.
+
+class LightweightCandidateGenerator(BaseCandidateGenerator):
+    def __init__(self, mlm_engine, embedder, analyzer, config):
+        super().__init__(embedder, analyzer, config)
         self.mlm_engine = mlm_engine
-        self.analyzer = analyzer
-        self.config = config
-        self.llm_client = llm_client
-        cg_cfg = self.config.get('candidate_generation', {})
-        stats_path = cg_cfg.get('naming_stats_path', 'naming_stats.json')
-        from utils.scorer import StatisticalNamingScorer
-        self.scorer = StatisticalNamingScorer(stats_path)
-
-    @torch.no_grad()
-    def _calculate_perplexity_batch(self, texts: List[str], batch_size: int = 4) -> List[float]:
-        # Calculates perplexity scores for a batch of text inputs using the LLM.
-        if not texts or not self.llm_client:
-            return [0.0] * len(texts)
-
-        tokenizer = getattr(self.llm_client, 'tokenizer', None)
-        model = getattr(self.llm_client, 'model', None)
-        if not tokenizer or not model: return [0.0] * len(texts)
-
-        device = model.device
-        ppls = []
-
-        for i in range(0, len(texts), batch_size):
-            batch_texts = texts[i:i + batch_size]
-            inputs = tokenizer(
-                batch_texts, return_tensors="pt", padding=True, truncation=True, max_length=1024
-            ).to(device)
-
-            outputs = model(input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"])
-
-            shift_logits = outputs.logits[..., :-1, :].contiguous()
-            shift_labels = inputs["input_ids"][..., 1:].contiguous()
-            shift_mask = inputs["attention_mask"][..., 1:].contiguous()
-
-            loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
-            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-            loss = loss.view(shift_labels.size(0), shift_labels.size(1)) * shift_mask
-
-            seq_lens = torch.clamp(shift_mask.sum(dim=1), min=1.0)
-            seq_loss = loss.sum(dim=1) / seq_lens
-
-            for val in seq_loss:
-                try:
-                    ppls.append(math.exp(val.item()))
-                except OverflowError:
-                    ppls.append(float('inf'))
-
-            del inputs, outputs, loss
-            if torch.cuda.is_available(): torch.cuda.empty_cache()
-
-        return ppls
-
-    def _get_dynamic_threshold(self, target_name: str, cand: str, base_threshold: float) -> float:
-        # Adjusts the semantic threshold dynamically based on structural similarity between names.
-        target_lower = target_name.lower()
-        cand_lower = cand.lower()
-
-        if cand_lower.endswith(f"_{target_lower}") or cand_lower.startswith(f"{target_lower}_"):
-            return min(0.99, base_threshold + 0.05)
-
-        if target_lower in cand_lower:
-            return min(0.99, base_threshold + 0.03)
-
-        import Levenshtein
-        if Levenshtein.distance(target_lower, cand_lower) <= 2:
-            return min(0.99, base_threshold + 0.07)
-
-        target_parts, target_sep = self._split_identifier(target_name)
-        cand_parts, cand_sep = self._split_identifier(cand)
-
-        if len(target_parts) > 1 and len(target_parts) == len(cand_parts) and target_sep == cand_sep:
-            identical_count = sum(1 for t, c in zip(target_parts, cand_parts) if t.lower() == c.lower())
-
-            if identical_count > 0:
-                overlap_ratio = identical_count / len(target_parts)
-
-                if overlap_ratio >= 0.5:
-                    base_penalty = 0.02
-                    ratio_penalty = overlap_ratio * 0.06
-                    penalty = base_penalty + ratio_penalty
-
-                    if target_parts[-1].lower() != cand_parts[-1].lower():
-                        penalty += 0.015
-
-                    return min(0.99, base_threshold + penalty)
-
-        return base_threshold
 
     def _get_mutation_pattern(self, target_name: str, cand_name: str) -> str:
         # Extracts the specific mutation pattern of target and candidate identifiers.
@@ -119,43 +35,6 @@ class LightweightCandidateGenerator:
 
         return '*'
 
-    def _detect_naming_style(self, name: str) -> str:
-        # Identifies the naming convention style of the given variable or function.
-        if not name:
-            return 'unknown'
-        core_name = name.strip('_')
-
-        if not core_name:
-            return 'unknown'
-        if '_' in core_name:
-            return 'SCREAMING_SNAKE' if core_name.isupper() else 'snake_case'
-        if core_name.islower():
-            return 'single_lower'
-        if core_name.isupper():
-            return 'single_upper'
-        if core_name[0].islower():
-            return 'camelCase'
-        if core_name[0].isupper():
-            return 'PascalCase'
-        return 'unknown'
-
-    def _matches_style(self, original_style: str, candidate: str) -> bool:
-        # Determines if the candidate matches the style format of the original name.
-        cand_style = self._detect_naming_style(candidate)
-        if original_style in ('snake_case', 'camelCase', 'PascalCase') and cand_style == 'single_lower': return True
-        if original_style == 'single_lower' and cand_style in ('snake_case', 'camelCase'): return True
-        if original_style == 'single_upper' and cand_style == 'SCREAMING_SNAKE': return True
-        return cand_style == original_style
-
-    def _split_identifier(self, name: str):
-        # Separates a multi-word identifier into individual lexical token components.
-        if '_' in name:
-            return name.split('_'), '_'
-        else:
-            parts = re.findall(r'[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|\d|\W|$)|\d+', name)
-            if not parts or (len(parts) == 1 and parts[0] == name): return [name], ''
-            return parts, 'camel'
-
     def _build_masked_string(self, parts: List[str], start: int, end: int, num_masks: int, style: str, mask_token: str,
                              target_name: str) -> str:
         # Synthesizes a code string with mask tokens inserted for MLM prediction.
@@ -174,52 +53,6 @@ class LightweightCandidateGenerator:
             return "".join(res).replace(mask_token.capitalize(), mask_token)
         else:
             return mask_token
-
-    def _extract_local_context_ast(self, code_bytes: bytes, target_start: int, target_end: int, tree) -> tuple[str, str]:
-        # Extracts neighboring syntax fragments surrounding the target variable from AST.
-        # from tree_sitter import Parser
-        # parser = Parser()
-        # parser.language = self.analyzer.language
-        # tree = parser.parse(code_bytes)
-        node = tree.root_node.descendant_for_byte_range(target_start, target_end)
-
-        if not node:
-            line_start = code_bytes.rfind(b'\n', 0, target_start) + 1
-            line_end = code_bytes.find(b'\n', target_end)
-            if line_end == -1: line_end = len(code_bytes)
-            return (code_bytes[line_start:target_start].decode("utf-8", errors="replace"),
-                    code_bytes[target_end:line_end].decode("utf-8", errors="replace"))
-
-        statement_node = node
-        stop_parent_types = {'compound_statement', 'translation_unit', 'function_definition', 'for_statement',
-                             'while_statement', 'if_statement'}
-
-        while statement_node.parent and statement_node.parent.type not in stop_parent_types:
-            statement_node = statement_node.parent
-
-        stmt_start = statement_node.start_byte
-        stmt_end = statement_node.end_byte
-        local_prefix = code_bytes[stmt_start:target_start].decode("utf-8", errors="replace")
-        local_suffix = code_bytes[target_end:stmt_end].decode("utf-8", errors="replace")
-        return local_prefix, local_suffix
-
-    def _find_best_context_occurrence(self, code_bytes: bytes, occurrences: List[dict], tree) -> int:
-        if len(occurrences) <= 1: return 0
-        best_idx, max_score = 0, -1.0
-        search_limit = min(len(occurrences), 10)
-
-        for i in range(search_limit):
-            occ = occurrences[i]
-            # 传入 tree
-            local_prefix, local_suffix = self._extract_local_context_ast(code_bytes, occ['start'], occ['end'], tree)
-            score = len(local_prefix) + len(local_suffix)
-            if '(' in local_suffix or ',' in local_suffix: score += 100
-            if any(k in local_prefix for k in ['if ', 'while ', 'for ', 'return ']): score += 80
-            if re.search(r'=\s*(0|NULL|nullptr|false|true|\{\})\s*;', local_suffix): score -= 150
-            if score > max_score:
-                max_score = score
-                best_idx = i
-        return best_idx
 
     def _get_model_logits_batched(self, cropped_codes: List[str]):
         # Runs MLM inference to predict masked token logits for a batch of code inputs.
@@ -251,138 +84,6 @@ class LightweightCandidateGenerator:
             if required_length is not None and len(w) != required_length: continue
             words.append(w)
         return words
-
-    def _get_variable_token_embeddings(self, prefixes: List[str], var_names: List[str], suffixes: List[str],
-                                       batch_size: int = 1024) -> torch.Tensor:
-        # Extracts contextual token embeddings representing variable semantics.
-        all_embeddings = []
-        tokenizer = self.mlm_engine.tokenizer
-        full_texts = [p + v + s for p, v, s in zip(prefixes, var_names, suffixes)]
-        device = self.mlm_engine.device
-        dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability(device)[
-            0] >= 8 else torch.float16
-        self.mlm_engine.model.to(dtype)
-
-        for i in range(0, len(full_texts), batch_size):
-            batch_texts = full_texts[i: i + batch_size]
-            batch_prefixes = prefixes[i: i + batch_size]
-            batch_vars = var_names[i: i + batch_size]
-
-            inputs = tokenizer(batch_texts, return_tensors="pt", padding=True, truncation=True, max_length=96).to(
-                device)
-
-            with torch.no_grad(), torch.amp.autocast(device_type='cuda', dtype=dtype):
-                outputs = self.mlm_engine.model.roberta(**inputs)
-                last_hidden = outputs.last_hidden_state
-
-            cached_p_tokens = {}
-            for b_idx in range(len(batch_texts)):
-                p_text = batch_prefixes[b_idx]
-                if p_text not in cached_p_tokens:
-                    cached_p_tokens[p_text] = tokenizer.encode(p_text, add_special_tokens=False)
-
-                p_tokens = cached_p_tokens[p_text]
-                pv_tokens = tokenizer.encode(p_text + batch_vars[b_idx], add_special_tokens=False)
-
-                shared_len = sum(1 for pt, pvt in zip(p_tokens, pv_tokens) if pt == pvt)
-                start_idx = min(shared_len + 1, 95)
-                end_idx = min(max(start_idx + 1, len(pv_tokens) + 1), 96)
-
-                pooled = last_hidden[b_idx, start_idx:end_idx, :].mean(dim=0)
-                all_embeddings.append(pooled.to(torch.float32).cpu())
-
-        return torch.stack(all_embeddings)
-
-    def _is_trivial_change(self, target_name: str, cand: str) -> bool:
-        # Identifies whether the candidate represents a trivial spelling change from original name.
-        target_parts, _ = self._split_identifier(target_name)
-        cand_parts, _ = self._split_identifier(cand)
-        if len(target_parts) > 2 and len(cand_parts) > 0:
-            identical_count = sum(1 for p1, p2 in zip(target_parts, cand_parts) if p1.lower() == p2.lower())
-            change_ratio = 1.0 - (identical_count / max(len(target_parts), len(cand_parts)))
-            return change_ratio <= 0.33
-        return False
-
-    def _verify_ast_single(self, cand: str, ctx: dict) -> str | None:
-        # Validates AST compliance for a proposed identifier replacement.
-        if not self.analyzer.can_rename_to(ctx['code_bytes'], ctx['target_name'], cand):
-            return None
-        try:
-            from utils.ast_tools import CodeTransformer
-            CodeTransformer.validate_and_apply(ctx['code_bytes'], ctx['identifiers'], {ctx['target_name']: cand},
-                                               analyzer=self.analyzer)
-            return cand
-        except Exception:
-            return None
-
-    def _verify_and_filter(self, candidate_list, quota, final_candidates, ctx):
-        # Filters candidates using semantic similarity thresholds, syntactic heuristic scores, and AST renaming verification.
-        base_threshold = ctx.get('semantic_threshold', 0.85)
-        entity_type = ctx.get('entity_type', 'VARIABLE')
-
-        base_cands = []
-        for cand in candidate_list:
-            if cand in ctx['keywords'] or cand == ctx['target_name']: continue
-            if ctx['preserve_style'] and not self._matches_style(ctx['original_style'], cand): continue
-            base_cands.append(cand)
-        if not base_cands: return 0
-
-        orig_emb = None
-        if base_threshold > 0:
-            orig_emb = self._get_variable_token_embeddings(
-                [ctx['local_prefix']], [ctx['target_name']], [ctx['local_suffix']]
-            ).to(self.mlm_engine.device)
-
-        added = 0
-        CHUNK_SIZE = max(50, quota * 2)
-        target_name = ctx['target_name']
-        target_parts, _ = self._split_identifier(target_name)
-        return_type = ctx.get('return_type', None)
-
-        for i in range(0, len(base_cands), CHUNK_SIZE):
-            if added >= quota: break
-
-            chunk = base_cands[i: i + CHUNK_SIZE]
-            filtered_chunk, heuristic_bonuses = [], []
-
-            for cand in chunk:
-                bonus = 0.0
-                if hasattr(self, 'scorer'):
-                    cand_parts, _ = self._split_identifier(cand)
-                    bonus = self.scorer.calculate_heuristic_score(cand_parts, entity_type, target_parts, return_type)
-                if bonus <= -100: continue
-                if not self.analyzer.can_rename_to(ctx['code_bytes'], ctx['target_name'], cand): continue
-                filtered_chunk.append(cand)
-                heuristic_bonuses.append(bonus)
-
-            if not filtered_chunk: continue
-
-            semantically_valid = []
-            if base_threshold > 0:
-                prefixes = [ctx['local_prefix']] * len(filtered_chunk)
-                suffixes = [ctx['local_suffix']] * len(filtered_chunk)
-                cand_embs = self._get_variable_token_embeddings(prefixes, filtered_chunk, suffixes).to(
-                    self.mlm_engine.device)
-                sims = F.cosine_similarity(orig_emb, cand_embs)
-                for cand, sim, bonus in zip(filtered_chunk, sims, heuristic_bonuses):
-                    final_score = sim.item() + bonus
-                    dynamic_threshold = self._get_dynamic_threshold(
-                        target_name, cand, base_threshold
-                    )
-
-                    if final_score >= dynamic_threshold:
-                        semantically_valid.append((cand, final_score))
-            else:
-                semantically_valid = [(cand, 1.0) for cand in filtered_chunk]
-
-            for cand, final_score in semantically_valid:
-                if added >= quota: break
-                valid_cand = self._verify_ast_single(cand, ctx)
-                if valid_cand and valid_cand not in final_candidates:
-                    final_candidates.append(valid_cand)
-                    added += 1
-
-        return added
 
     def generate_candidates(self, batch_tasks: List[Dict[str, Any]], top_k_mlm: int = 40, top_n_keep: int = 20,
                             ) -> Dict[str, List[str]]:
@@ -544,7 +245,14 @@ class LightweightCandidateGenerator:
             }
 
             final_candidates = []
-            self._verify_and_filter(unique_mlm_cands, top_n_keep, final_candidates, ctx)
+            self._verify_and_filter(
+                candidate_list=unique_mlm_cands,
+                quota=top_n_keep,
+                final_candidates=final_candidates,
+                ctx=ctx,
+                use_dynamic_threshold=True,
+                log_prefix="LightWeight"
+            )
             results[meta["target_name"]] = final_candidates
 
         return results
