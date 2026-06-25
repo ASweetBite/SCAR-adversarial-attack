@@ -1,10 +1,6 @@
 import gc
 import torch
 import heapq
-
-import gc
-import torch
-import heapq
 import random
 
 
@@ -33,9 +29,10 @@ class PSR_Ranker:
                 candidates = all_cands
             else:
                 head_cands = all_cands[:guaranteed_head_size]
-
                 tail_pool = all_cands[guaranteed_head_size:]
-                sample_count = test_sample_size - len(head_cands)
+
+                # 【优化保护】：防止 sample_count 为负数引发崩溃
+                sample_count = max(0, test_sample_size - len(head_cands))
 
                 if len(tail_pool) >= sample_count:
                     tail_cands = random.sample(tail_pool, sample_count)

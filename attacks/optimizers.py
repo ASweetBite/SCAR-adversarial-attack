@@ -325,8 +325,13 @@ class BeamSearchOptimizer:
         self.rename_fn = rename_fn
         self.mode = mode
 
+        # run_cfg = config.get('run_params', {}) if config else {}
+        # beam_cfg = config.get('beam_params', {}) if config else {}
+        # self.run_mode = run_cfg.get('run_mode', 'attack')
         run_cfg = config.get('run_params', {}) if config else {}
-        beam_cfg = config.get('beam_params', {}) if config else {}
+        attack_cfg = config.get('attack', {}) if config else {}
+        beam_cfg = attack_cfg.get('beam_search', {})  # 正确读取 attack 下的 beam_search
+
         self.run_mode = run_cfg.get('run_mode', 'attack')
 
         self.beam_size = beam_cfg.get('beam_size', 3)
