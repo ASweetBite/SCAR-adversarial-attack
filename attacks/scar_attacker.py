@@ -13,10 +13,66 @@ from attacks.rankers import PSR_Ranker
 from utils.model_zoo import ModelZooQueryTracker
 
 
+class CachedModelZooTracker:
+    def __init__(self, base_zoo):
+        self.base_zoo = base_zoo
+        self.model_names = getattr(base_zoo, 'model_names', [])
+        self.query_count = 0
+        self.cache = {}
+
+    def _get_hash(self, code):
+        return hash(code)
+
+    def predict(self, code, model_name):
+        k = (model_name, self._get_hash(code))
+        if k in self.cache:
+            return self.cache[k]  # 命中缓存，不增加计费！
+
+        self.query_count += 1
+        res = self.base_zoo.predict(code, model_name)
+        self.cache[k] = res
+        return res
+
+    def batch_predict(self, codes, model_name):
+        uncached_codes, uncached_indices = [], []
+        results = [None] * len(codes)
+
+        for i, code in enumerate(codes):
+            k = (model_name, self._get_hash(code))
+            if k in self.cache:
+                results[i] = self.cache[k]
+            else:
+                uncached_codes.append(code)
+                uncached_indices.append(i)
+
+        if uncached_codes:
+            self.query_count += len(uncached_codes)  # 只为没见过的代码计费
+            batch_probs, batch_preds = self.base_zoo.batch_predict(uncached_codes, model_name)
+            for idx, code, probs, pred in zip(uncached_indices, uncached_codes, batch_probs, batch_preds):
+                res = (probs, pred)
+                self.cache[(model_name, self._get_hash(code))] = res
+                results[idx] = res
+
+        final_probs = [r[0] for r in results]
+        final_preds = [r[1] for r in results]
+        return final_probs, final_preds
+
+    def predict_label_conf(self, code, label_idx, model_name):
+        probs, _ = self.predict(code, model_name)
+        return probs[label_idx]
+
+    def get_query_count(self):
+        return self.query_count
+
+    def reset_counter(self):
+        self.query_count = 0
+        self.cache.clear()  # 每个 target model 测试前清空缓存释放内存
+
 class SCARAttacker:
     def __init__(self, model_zoo, get_all_vars_fn, mlm_gen, llm_gen, rename_fn, mode: str, config: dict):
         # Initializes the attacker and parses hierarchical configuration parameters.
-        self.model_zoo = ModelZooQueryTracker(model_zoo)
+        # self.model_zoo = ModelZooQueryTracker(model_zoo)
+        self.model_zoo = CachedModelZooTracker(ModelZooQueryTracker(model_zoo))
         self.model_names = self.model_zoo.model_names
         self.mode = mode
         self.config = config
@@ -47,6 +103,7 @@ class SCARAttacker:
         self.llm_probe_quota = scar_cfg.get('llm_probe_quota', 4)
         self.max_llm_enrich_attempts = scar_cfg.get('max_llm_enrich_attempts', 2)
         self.rerank_after_llm_enrich = scar_cfg.get('rerank_after_llm_enrich', True)
+        # self.rerank_after_llm_enrich = False
 
         self.get_all_vars_fn = get_all_vars_fn
         self.mlm_gen = mlm_gen
@@ -213,7 +270,9 @@ class SCARAttacker:
 
                 rnns_output = rankers[atk_model].rank_variables(
                     code=code, variables=variables.copy(), subs_pool=rnns_eval_pool,
-                    reference_label=orig_pred, top_k=actual_top_k
+                    reference_label=orig_pred, top_k=actual_top_k,
+                    test_sample_size=3,  # 只取 2 个候选词试探
+                    guaranteed_head_size=2  # 确保取的是列表最前面的 2 个高质量词，而不是随机抽
                 )
 
                 if len(rnns_output) == 3:
@@ -261,7 +320,9 @@ class SCARAttacker:
 
                     rerank_output = rankers[atk_model].rank_variables(
                         code=code, variables=target_vars.copy(), subs_pool=final_subs_pool,
-                        reference_label=orig_pred, top_k=len(target_vars)
+                        reference_label=orig_pred, top_k=len(target_vars),
+                        test_sample_size=3,  # 重排时总共只测 5 个词 (原默认是10个)
+                        guaranteed_head_size=2  # 其中前 4 个强制取头部的高质量词，尾部随机 1 个
                     )
                     if len(rerank_output) == 3:
                         target_vars, rerank_scores, rnns_best_seed = rerank_output
