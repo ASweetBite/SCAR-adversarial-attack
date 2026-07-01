@@ -43,9 +43,10 @@ def main(args, config):
     mlm_engine_name = config['models'].get('mlm_engine', 'microsoft/codebert-base-mlm')
     mlm_engine = MLMEngine(mlm_engine_name)
 
-    llm_name = config['models'].get('llm_generator', 'qwen3.5:9b')
+    llm_name = config['models'].get('llm_generator', 'models/qwen2.5-1.5b-code')
     llm_client = LocalLLMClient(model_name=llm_name)
-    code_embedder = CodeEmbedder(model_name="microsoft/unixcoder-base")
+    embedder_name = config['models'].get('code_embedder', 'microsoft/codebert-base-mlm')
+    code_embedder = CodeEmbedder(model_name=embedder_name)
 
     lightweight_generator = LightweightCandidateGenerator(
         mlm_engine=mlm_engine,
