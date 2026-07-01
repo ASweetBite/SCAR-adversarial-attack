@@ -623,7 +623,7 @@ def main():
     lang = config.get('global', {}).get('lang', 'cpp')
     analyzer = IdentifierAnalyzer(lang=lang)
 
-    ppl_model_name = config['models'].get('llm_generator', 'Qwen/Qwen2.5-1.5B-Coder')
+    ppl_model_name = "models/deepseek-coder"
     ppl_calculator = PPLCalculator(model_name_or_path=ppl_model_name)
 
     mlm_engine_name = config['models'].get('mlm_engine', 'microsoft/codebert-base-mlm')
