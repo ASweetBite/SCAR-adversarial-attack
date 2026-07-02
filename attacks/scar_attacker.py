@@ -208,6 +208,9 @@ class SCARAttacker:
                     except Exception:
                         target_code_str = code
 
+                # # [消融] 禁用 AST 骨架折叠，直接传入全量代码
+                # target_code_str = code
+
                 batch_tasks.append({
                     "target_name": var, "code_str": target_code_str,
                     "full_code_str": code, "full_identifiers": full_identifiers
@@ -495,3 +498,392 @@ class SCARAttacker:
                 row += f" {asr:>11.2f}% |"
             self._log(row)
         self._log("=" * 90 + "\n")
+
+# import os
+# import time
+# import csv
+# import json
+# from typing import List, Dict
+#
+#
+# from attacks.rankers import PSR_Ranker
+#
+#
+# # =========================================================================
+# # 计步器与缓存器 (拦截预测请求，计算 Query 并利用缓存加速)
+# # =========================================================================
+# class CachedModelZooTracker:
+#     def __init__(self, base_zoo):
+#         self.base_zoo = base_zoo
+#         self.model_names = getattr(base_zoo, 'model_names', [])
+#         self.query_count = 0
+#         self.cache = {}
+#
+#     def _get_hash(self, code):
+#         return hash(code)
+#
+#     def predict(self, code, model_name):
+#         k = (model_name, self._get_hash(code))
+#         if k in self.cache:
+#             return self.cache[k]  # 命中缓存，不计费
+#
+#         self.query_count += 1
+#         res = self.base_zoo.predict(code, model_name)
+#         self.cache[k] = res
+#         return res
+#
+#     def batch_predict(self, codes, model_name):
+#         uncached_codes, uncached_indices = [], []
+#         results = [None] * len(codes)
+#
+#         for i, code in enumerate(codes):
+#             k = (model_name, self._get_hash(code))
+#             if k in self.cache:
+#                 results[i] = self.cache[k]
+#             else:
+#                 uncached_codes.append(code)
+#                 uncached_indices.append(i)
+#
+#         if uncached_codes:
+#             self.query_count += len(uncached_codes)  # 仅为没见过的代码计费
+#             batch_probs, batch_preds = self.base_zoo.batch_predict(uncached_codes, model_name)
+#             for idx, code, probs, pred in zip(uncached_indices, uncached_codes, batch_probs, batch_preds):
+#                 res = (probs, pred)
+#                 self.cache[(model_name, self._get_hash(code))] = res
+#                 results[idx] = res
+#
+#         final_probs = [r[0] for r in results]
+#         final_preds = [r[1] for r in results]
+#         return final_probs, final_preds
+#
+#     def predict_label_conf(self, code, label_idx, model_name):
+#         probs, _ = self.predict(code, model_name)
+#         # 防止越界，返回指定标签的概率
+#         if label_idx < len(probs):
+#             return probs[label_idx]
+#         return 0.0
+#
+#     def get_query_count(self):
+#         return self.query_count
+#
+#     def reset_counter(self):
+#         self.query_count = 0
+#         self.cache.clear()
+#
+#
+# # =========================================================================
+# # 纯净版 Attacker 逻辑 (包含完整的数据统计、日志与文件保存)
+# # =========================================================================
+# class SCARAttacker:
+#     def __init__(self, model_zoo, get_all_vars_fn, mlm_gen, llm_gen, rename_fn, mode: str, config: dict):
+#         self.model_zoo = CachedModelZooTracker(model_zoo)
+#         self.model_names = self.model_zoo.model_names
+#         self.mode = mode
+#         self.config = config
+#
+#         self.result_dir = config.get('global', {}).get('result_dir', "./results")
+#         self.run_mode = config.get('run_params', {}).get('run_mode', 'attack')
+#         self.optimizer_type = str(config.get('attack', {}).get('algorithm', 'beam')).lower()
+#         self.top_k = config.get('attack', {}).get('scar', {}).get('top_k', 10)
+#         self.total_quota = config.get('attack', {}).get('scar', {}).get('total_quota', 50)
+#
+#         self.get_all_vars_fn = get_all_vars_fn
+#         self.mlm_gen = mlm_gen
+#         self.llm_gen = llm_gen
+#         self.rename_fn = rename_fn
+#         self.attack_logs = []
+#
+#     def _log(self, message=""):
+#         print(message)
+#         self.attack_logs.append(message)
+#
+#     def attack(self, dataset: List[Dict]):
+#         self.attack_logs = []
+#         # 初始化统计矩阵
+#         stats = {atk: {vic: {"total": 0, "fooled": 0, "success_queries": []} for vic in self.model_names} for atk in
+#                  self.model_names}
+#         storage_orig = {m: [] for m in self.model_names}
+#         storage_adv = {m: [] for m in self.model_names}
+#
+#         # 时间统计
+#         total_valid_sample_time = 0.0
+#         valid_sample_count = 0
+#         model_time_stats = {m: 0.0 for m in self.model_names}
+#         model_valid_counts = {m: 0 for m in self.model_names}
+#
+#         rankers = {m: PSR_Ranker(self.model_zoo, m, self.rename_fn) for m in self.model_names}
+#
+#         from attacks.optimizers import BeamSearchOptimizer
+#         optimizers = {}
+#         for m in self.model_names:
+#             opt_kwargs = {"model_zoo": self.model_zoo, "target_model": m, "rename_fn": self.rename_fn,
+#                           "mode": self.mode, "config": self.config}
+#             if self.optimizer_type == "beam":
+#                 optimizers[m] = BeamSearchOptimizer(**opt_kwargs)
+#             else:
+#                 raise ValueError("Pure version only supports 'beam' search. Check your config.yaml.")
+#
+#         for idx, sample in enumerate(dataset):
+#             t_sample_start = time.time()
+#             self._log(f"\n=========================================\n🎯· [Sample {idx}] Started")
+#             code = sample["code"]
+#             ground_truth = sample.get("label")
+#             orig_predictions = {}
+#             has_correct_pred = False
+#
+#             # 基线预测
+#             for m in self.model_names:
+#                 probs, pred = self.model_zoo.predict(code, m)
+#                 orig_predictions[m] = {"probs": probs, "pred": pred}
+#                 if pred == ground_truth: has_correct_pred = True
+#
+#             if not has_correct_pred:
+#                 self._log(f"    - Skipping: All models predicted incorrectly.")
+#                 continue
+#
+#             variables = self.get_all_vars_fn(code)
+#             if not variables: continue
+#
+#             # [1] 启用 AST 切片：将代码按变量逻辑进行折叠
+#             code_bytes = code.encode("utf-8")
+#             full_identifiers = self.mlm_gen.analyzer.extract_identifiers(code_bytes)
+#             batch_tasks = []
+#
+#             for var in variables:
+#                 if var not in full_identifiers: continue
+#                 # 如果是函数或类名，就不切片；如果是局部变量，就执行折叠提取骨架
+#                 is_callable = all(
+#                     occ.get("entity_type") in ["function", "method", "class"] for occ in full_identifiers[var])
+#                 if is_callable:
+#                     target_code_str = code
+#                 else:
+#                     try:
+#                         target_code_str = self.mlm_gen.analyzer.get_folded_code(code_bytes, var)
+#                     except Exception:
+#                         target_code_str = code
+#
+#                 batch_tasks.append({
+#                     "target_name": var,
+#                     "code_str": target_code_str,  # 这是折叠后的精简代码 (供大模型看)
+#                     "full_code_str": code,  # 这是原代码 (供最后验证用)
+#                     "full_identifiers": full_identifiers
+#                 })
+#
+#             self._log("    - Generating MLM & LLM candidates for ALL variables...")
+#             mlm_pool = self.mlm_gen.generate_candidates(batch_tasks, top_k_mlm=self.total_quota)
+#             llm_pool = self.llm_gen.generate_candidates(batch_tasks, target_quota=self.total_quota)
+#
+#             # [2] 合并候选池 (核心修复：保持 LLM 的优质词汇排在最前面！)
+#             final_subs_pool = {}
+#             for v in variables:
+#                 llm_cands = llm_pool.get(v, [])
+#                 mlm_cands = mlm_pool.get(v, [])
+#
+#                 merged_cands = list(llm_cands)
+#                 for cand in mlm_cands:
+#                     if cand not in merged_cands:
+#                         merged_cands.append(cand)
+#
+#                 final_subs_pool[v] = merged_cands[:self.total_quota]
+#
+#             sample_attacked_by_any = False
+#             for atk_model in self.model_names:
+#                 t_atk_model_start = time.time()
+#                 orig_pred = orig_predictions[atk_model]["pred"]
+#                 if orig_pred != ground_truth:
+#                     self._log(f"    - {atk_model}: Initial prediction incorrect, skipping model attack.")
+#                     continue
+#
+#                 stats[atk_model][atk_model]["total"] += 1
+#                 self.model_zoo.reset_counter()
+#
+#                 # [3] 单轮 PSR 试探与排序 (最优配置：测5个，头3个给LLM)
+#                 t_rnns_start = time.time()
+#                 rnns_output = rankers[atk_model].rank_variables(
+#                     code=code,
+#                     variables=variables.copy(),
+#                     subs_pool=final_subs_pool,  # <--- 使用排好序的 final_subs_pool
+#                     reference_label=orig_pred,
+#                     top_k=self.top_k,
+#                     test_sample_size=5,  # 总共测 5 个词
+#                     guaranteed_head_size=3  # 前 3 个锁定给 LLM 的极品词
+#                 )
+#
+#                 if len(rnns_output) == 3:
+#                     ranked_vars, all_scores, rnns_best_seed = rnns_output
+#                 else:
+#                     ranked_vars, all_scores = rnns_output
+#                 self._log(f"    - PSR Ranker finished in: {time.time() - t_rnns_start:.2f}s")
+#
+#                 # [4] 截取最脆弱的 Top-K 个变量
+#                 target_vars = ranked_vars[:self.top_k]
+#
+#                 # [5] 送进波束搜索
+#                 t_opt_start = time.time()
+#                 is_success, adv_code, adv_probs, adv_pred = optimizers[atk_model].run(
+#                     code=code,
+#                     original_pred=orig_pred,
+#                     target_vars=target_vars,  # 仅搜索最脆弱的 10 个变量
+#                     subs_pool=final_subs_pool,  # 完整的候选池
+#                     variable_scores=all_scores
+#                 )[:4]
+#
+#             # sample_attacked_by_any = False
+#             # for atk_model in self.model_names:
+#             #     t_atk_model_start = time.time()
+#             #     orig_pred = orig_predictions[atk_model]["pred"]
+#             #     if orig_pred != ground_truth:
+#             #         self._log(f"    - {atk_model}: Initial prediction incorrect, skipping model attack.")
+#             #         continue
+#             #
+#             #     stats[atk_model][atk_model]["total"] += 1
+#             #     self.model_zoo.reset_counter()
+#             #
+#             #     t_opt_start = time.time()
+#             #     is_success, adv_code, adv_probs, adv_pred = optimizers[atk_model].run(
+#             #         code=code, original_pred=orig_pred, target_vars=target_vars,
+#             #         subs_pool=final_subs_pool, variable_scores=None
+#             #     )[:4]
+#
+#                 self._log(f"    - Optimization Run: {time.time() - t_opt_start:.2f}s")
+#
+#                 queries_consumed = self.model_zoo.get_query_count()
+#                 model_elapsed = time.time() - t_atk_model_start
+#                 model_time_stats[atk_model] += model_elapsed
+#                 model_valid_counts[atk_model] += 1
+#                 sample_attacked_by_any = True
+#
+#                 # 保存记录
+#                 storage_adv[atk_model].append({
+#                     "sample_index": idx, "original_code": code,
+#                     "adversarial_code": adv_code if is_success else "",
+#                     "ground_truth_label": ground_truth,
+#                     "original_prediction": orig_pred, "adversarial_prediction": adv_pred,
+#                     "is_success": is_success, "queries_consumed": queries_consumed,
+#                     "attack_time_seconds": round(model_elapsed, 2)
+#                 })
+#
+#                 if is_success:
+#                     stats[atk_model][atk_model]["fooled"] += 1
+#                     stats[atk_model][atk_model]["success_queries"].append(queries_consumed)
+#                     self._log(f"    ✅ Success | {orig_pred} -> {adv_pred} | Queries: {queries_consumed}")
+#
+#                     # 迁移性测试
+#                     for vic_model in self.model_names:
+#                         if vic_model == atk_model: continue
+#                         if orig_predictions[vic_model]["pred"] == ground_truth:
+#                             stats[atk_model][vic_model]["total"] += 1
+#                             _, vic_adv_pred = self.model_zoo.predict(adv_code, vic_model)
+#                             if vic_adv_pred != orig_predictions[vic_model]["pred"]:
+#                                 stats[atk_model][vic_model]["fooled"] += 1
+#                 else:
+#                     self._log(f"    ❌ Failed | Queries: {queries_consumed}")
+#
+#             if sample_attacked_by_any:
+#                 total_valid_sample_time += (time.time() - t_sample_start)
+#                 valid_sample_count += 1
+#
+#         # =====================================================================
+#         # 总结输出 (Summary Generation)
+#         # =====================================================================
+#         self._log("\n" + "=" * 50)
+#         self._log("🎯 FINAL ATTACK SUMMARY")
+#         self._log("=" * 50)
+#
+#         asr_matrix, avg_queries = {}, {}
+#         for atk_m in self.model_names:
+#             asr_matrix[atk_m] = {}
+#             success_queries = stats[atk_m][atk_m]["success_queries"]
+#             avg_q = round(sum(success_queries) / len(success_queries), 2) if success_queries else 0.0
+#             avg_queries[atk_m] = avg_q
+#
+#             total_atk = stats[atk_m][atk_m]["total"]
+#             fooled_atk = stats[atk_m][atk_m]["fooled"]
+#             asr_atk = (fooled_atk / total_atk * 100) if total_atk > 0 else 0.0
+#
+#             self._log(f"🛡️ Target Model: {atk_m.upper()}")
+#             self._log(f"   ► ASR (Attack Success Rate) : {asr_atk:.2f}% ({fooled_atk}/{total_atk})")
+#             self._log(f"   ► Avg. Queries (Success)    : {avg_q}")
+#             self._log("-" * 50)
+#
+#             for vic_m in self.model_names:
+#                 total = stats[atk_m][vic_m]["total"]
+#                 fooled = stats[atk_m][vic_m]["fooled"]
+#                 asr = (fooled / total * 100) if total > 0 else 0.0
+#                 asr_matrix[atk_m][vic_m] = round(asr, 2)
+#
+#         self._log("\n" + "=" * 50)
+#         self._log("⏱️ TIME STATISTICS (Valid Samples Only)")
+#         self._log("=" * 50)
+#         avg_sample_time = (total_valid_sample_time / valid_sample_count) if valid_sample_count > 0 else 0.0
+#
+#         self._log(f"   ► Valid Attacked Samples    : {valid_sample_count}")
+#         self._log(f"   ► Avg. Total Time / Sample  : {avg_sample_time:.2f}s")
+#         self._log("-" * 50)
+#         for m in self.model_names:
+#             m_count = model_valid_counts[m]
+#             avg_m_time = (model_time_stats[m] / m_count) if m_count > 0 else 0.0
+#             self._log(f"     * {m.upper():<12} | Valid attacks: {m_count:<3} | Avg Time: {avg_m_time:.2f}s")
+#         self._log("=" * 50)
+#
+#         # 保存结果
+#         self.save_results(storage_orig, storage_adv)
+#         self.print_summary(stats)
+#
+#         return asr_matrix, avg_queries
+#
+#     def save_results(self, storage_orig, storage_adv):
+#         result_dir = self.result_dir
+#         if not os.path.exists(result_dir):
+#             os.makedirs(result_dir)
+#
+#         log_filename = os.path.join(result_dir, f"attack_logs_{self.mode}_{int(time.time())}.txt")
+#         try:
+#             with open(log_filename, 'w', encoding='utf-8') as f:
+#                 f.write("\n".join(self.attack_logs))
+#             print(f"[INFO] Successfully saved logs to: {log_filename}")
+#         except Exception as e:
+#             print(f"[ERROR] Failed to save logs to {log_filename}: {e}")
+#
+#         for model in self.model_names:
+#             adv_data = storage_adv[model]
+#             if adv_data:
+#                 adv_filename = f"adv_test_set_{model}_{self.mode}.csv"
+#                 adv_path = os.path.join(result_dir, adv_filename)
+#                 self._write_csv(adv_path, adv_data)
+#
+#             if self.run_mode == "dataset" and storage_orig[model]:
+#                 orig_filename = f"orig_dataset_{model}_{self.mode}.csv"
+#                 orig_path = os.path.join(result_dir, orig_filename)
+#                 self._write_csv(orig_path, storage_orig[model])
+#
+#     def _write_csv(self, filename, data):
+#         if not data: return
+#         try:
+#             fieldnames = list(data[0].keys())
+#             with open(filename, 'w', encoding='utf-8', newline='') as f:
+#                 writer = csv.DictWriter(f, fieldnames=fieldnames)
+#                 writer.writeheader()
+#                 writer.writerows(data)
+#             print(f"[INFO] Saved {len(data)} detailed records to CSV: {filename}")
+#         except Exception as e:
+#             print(f"[ERROR] Failed to save CSV {filename}: {e}")
+#
+#     def print_summary(self, stats):
+#         self._log("\n" + "=" * 90)
+#         self._log("📊 FINAL CROSS-MODEL TRANSFERABILITY MATRIX (ASR %)")
+#         self._log("=" * 90)
+#         header = f"{'Attacker \\ Victim':<20} |"
+#         for m in self.model_names:
+#             header += f" {m:<13} |"
+#         self._log(header)
+#         self._log("-" * len(header))
+#         for atk_m in self.model_names:
+#             row = f"{atk_m:<20} |"
+#             for vic_m in self.model_names:
+#                 total = stats[atk_m][vic_m]["total"]
+#                 fooled = stats[atk_m][vic_m]["fooled"]
+#                 asr = (fooled / total * 100) if total > 0 else 0.0
+#                 row += f" {asr:>11.2f}% |"
+#             self._log(row)
+#         self._log("=" * 90 + "\n")
