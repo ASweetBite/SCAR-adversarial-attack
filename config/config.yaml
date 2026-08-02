@@ -1,13 +1,13 @@
 global:
   random_seed: 42
-  result_dir: "./results"
+  result_dir: "./results/diverse"
   # Target programming language for AST parsing ('cpp' or 'c').
   lang: "cpp"
 
 run_params:
   samples: 300
   # Path to the input dataset in Parquet format.
-  dataset: "./data/alert/test.parquet"
+  dataset: "./data/diverse/test.parquet"
   # Path to the JSON file mapping integer IDs to string labels(only used in "multi" mode).
   label_map: "./models/finetuned_model_codebert_1/label_map.json"
   # Number of classification classes.
@@ -17,12 +17,15 @@ models:
   # HuggingFace ID or local path for the Masked Language Model (used for embeddings and lightweight generation).
   mlm_engine: "microsoft/codebert-base-mlm"
   # Local path or ID for the LLM used to generate deep semantic replacements.
-  llm_generator: "qwen3.5:9b"
+  llm_generator: "models/qwen2.5-1.5b-code"
   # Dictionary of target classification models to attack.
   target_models:
-    CodeBERT: "./models/ALERT_CodeBERT"
-    # GraphCodeBERT: "./models/binary_diversevul_graphcodebert"
-#    UniXcoder: "./models/UniXcoder_best_f1"
+#    CodeBERT: "./models/ALERT_CodeBERT"
+#    linevul: "./models/linevul_devign"
+    CodeBERT: "./models/CodeBERT_best_f1"
+    GraphCodeBERT: "./models/GraphCodeBERT_best_f1"
+    UniXcoder: "./models/UniXcoder_best_f1"
+    VulCNN: "/home/rrz/scar_test_rrz/data/alert/processed/train_test_results"
 
 candidate_generation:
   # Whether to strictly maintain the original naming style (e.g., camelCase, snake_case).
