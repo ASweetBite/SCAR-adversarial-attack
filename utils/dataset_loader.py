@@ -27,6 +27,9 @@ class DatasetLoader:
 
         df = pd.read_parquet(filepath)
 
+        if 'id' not in df.columns:
+            df['id'] = df.index
+
         if 'func' not in df.columns or 'vul' not in df.columns:
             raise ValueError("Parquet file must contain 'func' and 'vul' columns.")
 
@@ -144,11 +147,16 @@ class DatasetLoader:
             raise ValueError("Mode must be 'binary' or 'multi'")
 
         for _, row in df.iterrows():
+            func_id = str(row['id'])
+            vul_val = int(row['vul'])
+            sample_id = f"{vul_val}_{func_id}"
+
             processed_data.append({
                 "code": row["func"],
                 "label": int(row["label"]),
                 "raw_cwe": row.get("cwe", ""),
-                "vul": row["vul"]
+                "vul": row["vul"],
+                "sample_id": sample_id
             })
 
         print(f"[*] Successfully processed {len(processed_data)} samples.")

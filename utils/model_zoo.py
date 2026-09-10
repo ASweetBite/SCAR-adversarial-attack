@@ -118,7 +118,7 @@ class ModelZoo:
         self.analyzer = None
         if any("vulcnn" in name.lower() for name in self.model_names):
             print("[*] Detected VulCNNPlus. Initializing Word2Vec Extractor...")
-            self.vulcnn_w2v = KeyedVectors.load_word2vec_format("./dataset/data_model.bin", binary=True)
+            self.vulcnn_w2v = KeyedVectors.load_word2vec_format("./VulCNNPlus/dataset/data_model.bin", binary=True)
         if any("graphcodebert" in name.lower() for name in self.model_names):
             print("[*] Detected GraphCodeBERT in targets. Initializing DFG Extractor...")
             # 假设 IdentifierAnalyzer 已经处理好离线问题
@@ -406,8 +406,7 @@ class ModelZoo:
     # 推断接口动态路由 (Prediction Dispatcher)
     # =========================================================================
 
-    # [修改签名] 加上 **kwargs
-    def predict(self, code: str, target_model: str, **kwargs) -> Tuple[List[float], int]:
+    def predict(self, code: str, target_model: str) -> Tuple[List[float], int]:
         m = self.models.get(target_model)
         if m is None:
             return [1.0, 0.0], -1
@@ -416,17 +415,13 @@ class ModelZoo:
         model_name_lower = target_model.lower()
 
         with torch.no_grad():
-            # =====================================================
-            # [新增] VulCNNPlus 推理通道
-            # =====================================================
             if m.get("type") == "cnn" and "vulcnn" in model_name_lower:
-                sample_id = kwargs.get("sample_id")
-                rename_mapping = kwargs.get("rename_mapping", {})
-
+                sample_id = getattr(self, "current_sample_id", None)
                 if not sample_id:
-                    raise ValueError("VulCNN 推理需要通过 kwargs 传入 'sample_id' 定位原始 dot 图。")
+                    raise ValueError("未找到 current_sample_id，请检查 SCARAttacker 注入逻辑。")
 
-                # 1. 生成 4个视图的原始/变异特征
+                rename_mapping = getattr(self, "code_to_mapping_cache", {}).get(hash(code), {})
+
                 all_views = self._fast_vulcnn_encode(sample_id, rename_mapping)
 
                 # 2. 补齐与对齐 Dataset 形状 -> 4 x (1, 6, 100, 128)
@@ -490,7 +485,7 @@ class ModelZoo:
 
         return probs, pred_label
 
-    def batch_predict(self, codes: List[str], target_model: str, batch_size: int = 32, **kwargs) -> Tuple[
+    def batch_predict(self, codes: List[str], target_model: str, batch_size: int = 32) -> Tuple[
         List[List[float]], List[int]]:
         """安全的 Batch Predict: 兼容各种非标准架构的特征重组"""
         m = self.models.get(target_model)
@@ -505,20 +500,6 @@ class ModelZoo:
         # =================================================================
         # [新增] 针对 VulCNNPlus Batch 处理的参数校验与提取
         # =================================================================
-        sample_ids = kwargs.get("sample_ids", [])
-        rename_mappings = kwargs.get("rename_mappings", [])
-
-        if model_type == "cnn" and "vulcnn" in model_name_lower:
-            # 必须保证传入的 sample_ids 列表长度与代码列表一致
-            if not sample_ids or len(sample_ids) != len(codes):
-                raise ValueError(
-                    f"[!] 对于 VulCNNPlus 批量预测，必须在 kwargs 中传入等长的 'sample_ids' 列表！(期待 {len(codes)} 个)")
-
-            # 如果没传 rename_mappings，就用空字典补齐 (说明是单纯测原版数据)
-            if not rename_mappings:
-                rename_mappings = [{}] * len(codes)
-            elif len(rename_mappings) != len(codes):
-                raise ValueError("[!] 'rename_mappings' 列表长度必须与 codes 列表相等！")
 
         all_probs, all_preds = [], []
 
@@ -526,21 +507,19 @@ class ModelZoo:
             batch_codes = codes[i:i + batch_size]
 
             with torch.no_grad():
-                # =========================================================
-                # [新增] VulCNNPlus 的 Batch 组装分支
-                # =========================================================
                 if model_type == "cnn" and "vulcnn" in model_name_lower:
-                    b_sample_ids = sample_ids[i:i + batch_size]
-                    b_rename_mappings = rename_mappings[i:i + batch_size]
+                    b_sample_id = getattr(self, "current_sample_id", None)
+                    # 批量从记忆体中获取 mapping
+                    b_rename_mappings = [
+                        getattr(self, "code_to_mapping_cache", {}).get(hash(c), {})
+                        for c in batch_codes
+                    ]
 
-                    # 准备 4 个视图的容器，后续转为 (Batch, 6, 100, 128)
                     b_view_0, b_view_1, b_view_2, b_view_3 = [], [], [], []
                     max_len, hidden_size = 100, 128
 
-                    # 遍历 Batch 里的每一条数据
-                    for s_id, r_map in zip(b_sample_ids, b_rename_mappings):
-                        # 调用我们写的极速引擎，获取 4 个视图
-                        all_views = self._fast_vulcnn_encode(s_id, r_map)
+                    for r_map in b_rename_mappings:
+                        all_views = self._fast_vulcnn_encode(b_sample_id, r_map)
 
                         # 执行 Padding
                         padded_views = []

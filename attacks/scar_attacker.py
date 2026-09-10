@@ -173,8 +173,15 @@ class SCARAttacker:
 
             code = sample["code"]
             ground_truth = sample.get("label")
+
+            real_zoo = self.model_zoo
+            while hasattr(real_zoo, "base_zoo") or hasattr(real_zoo, "_model_zoo"):
+                real_zoo = getattr(real_zoo, "base_zoo", getattr(real_zoo, "_model_zoo", real_zoo))
+            real_zoo.current_sample_id = sample.get("sample_id")
+
             orig_predictions = {}
             has_correct_pred = False
+
 
             for m in self.model_names:
                 probs, pred = self.model_zoo.predict(code, m)
@@ -265,17 +272,53 @@ class SCARAttacker:
                     self._log(f"    - {atk_model}: Initial prediction incorrect, skipping model attack.")
                     continue
 
+                # -------------------------------------------------------------
+                # 🌟 [新增] 靶机专属鉴权：针对 VulCNNPlus 进行“特征截断跳过”与“瘦身”
+                # -------------------------------------------------------------
+                import re
+                current_model_variables = variables.copy()
+
+                if "vulcnn" in atk_model.lower():
+                    graph_words = set()
+                    sample_id = sample.get("sample_id")
+
+                    # 遍历四种图，从缓存中捞出所有幸存的单词
+                    for g_type in ['pdg', 'cfg', 'ddg', 'ast']:
+                        cache_key = f"{sample_id}_{g_type}"
+                        if hasattr(real_zoo, "vulcnn_graph_cache") and cache_key in real_zoo.vulcnn_graph_cache:
+                            labels_code = real_zoo.vulcnn_graph_cache[cache_key][0]
+                            all_graph_text = " ".join(labels_code.values())
+                            graph_words.update(re.findall(r'\b[a-zA-Z_]\w*\b', all_graph_text))
+
+                    # 取交集：只保留既被 AST 认定为变量，又存活在图节点中的词
+                    survived_vars = [v for v in current_model_variables if v in graph_words]
+
+                    if not survived_vars:
+                        self._log(
+                            f"    - {atk_model}: 🛡️ [Structural Immunity] AST 提取的变量全部被图节点截断丢弃，跳过攻击，不计入失败！")
+                        continue  # 关键：在这里 continue，就不会执行下面的 total += 1
+
+                    dropped_count = len(current_model_variables) - len(survived_vars)
+                    if dropped_count > 0:
+                        self._log(
+                            f"    - {atk_model}: ✂️ 优化器瘦身 -> {dropped_count} 个变量被 Joern 遗弃。有效靶点从 {len(current_model_variables)} 缩减至 {len(survived_vars)}。")
+
+                    current_model_variables = survived_vars
+                # -------------------------------------------------------------
+
+                # 只有通过了鉴权，才算作有效攻击分母！
                 stats[atk_model][atk_model]["total"] += 1
                 self.model_zoo.reset_counter()
 
                 t_rnns_start = time.time()
-                actual_top_k = min(self.top_k, len(variables))
+                actual_top_k = min(self.top_k, len(current_model_variables))
 
+                # 【注意】这里传入的 variables 改成了过滤后的 current_model_variables
                 rnns_output = rankers[atk_model].rank_variables(
-                    code=code, variables=variables.copy(), subs_pool=rnns_eval_pool,
+                    code=code, variables=current_model_variables, subs_pool=rnns_eval_pool,
                     reference_label=orig_pred, top_k=actual_top_k,
-                    test_sample_size=3,  # 只取 2 个候选词试探
-                    guaranteed_head_size=2  # 确保取的是列表最前面的 2 个高质量词，而不是随机抽
+                    test_sample_size=3,
+                    guaranteed_head_size=2
                 )
 
                 if len(rnns_output) == 3:

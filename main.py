@@ -178,6 +178,9 @@ def main(args, config):
 
     model_configs = config['models'].get('target_models', {})
     model_zoo = ModelZoo(model_configs=model_configs, eval_mode=args.mode, config=config)
+
+    model_zoo.code_to_mapping_cache = {}
+
     transformer = CodeTransformer()
 
     def get_all_identifiers_fn(code_str: str) -> list:
@@ -187,7 +190,11 @@ def main(args, config):
     def rename_fn(code_str: str, renaming_map: dict) -> str:
         code_bytes = code_str.encode("utf-8")
         ids = analyzer.extract_identifiers(code_bytes)
-        return transformer.validate_and_apply(code_bytes, ids, renaming_map, analyzer=analyzer)
+        new_code = transformer.validate_and_apply(code_bytes, ids, renaming_map, analyzer=analyzer)
+
+        model_zoo.code_to_mapping_cache[hash(new_code)] = renaming_map
+
+        return new_code
 
     config['run_params']['algorithm'] = config['attack'].get('algorithm', 'beam')
 
